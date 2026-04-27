@@ -1,0 +1,29 @@
+# Sessions / secrets — NEVER commit
+*.session
+*.session-journal
+*.enc
+sessions/
+.tgmcp/
+config.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+audit.log
