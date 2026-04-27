@@ -72,5 +72,48 @@ class DaemonClient:
     def send(self, chat: str | int, text: str, reply_to: int | None = None) -> dict[str, Any]:
         return self._post("/send", {"chat": chat, "text": text, "reply_to": reply_to})
 
+    def edit(self, chat: str | int, msg_id: int, text: str) -> dict[str, Any]:
+        return self._post("/edit", {"chat": chat, "msg_id": msg_id, "text": text})
+
+    def delete(
+        self,
+        chat: str | int,
+        msg_ids: list[int],
+        revoke: bool = True,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/delete", {"chat": chat, "msg_ids": msg_ids, "revoke": revoke}
+        )
+
+    def forward(
+        self,
+        from_chat: str | int,
+        to_chat: str | int,
+        msg_ids: list[int],
+    ) -> dict[str, Any]:
+        return self._post(
+            "/forward",
+            {"from_chat": from_chat, "to_chat": to_chat, "msg_ids": msg_ids},
+        )
+
+    def pin(self, chat: str | int, msg_id: int, notify: bool = True) -> dict[str, Any]:
+        return self._post("/pin", {"chat": chat, "msg_id": msg_id, "notify": notify})
+
+    def unpin(self, chat: str | int, msg_id: int | None = None) -> dict[str, Any]:
+        return self._post("/unpin", {"chat": chat, "msg_id": msg_id})
+
+    def react(
+        self,
+        chat: str | int,
+        msg_id: int,
+        emoji: str | None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/react", {"chat": chat, "msg_id": msg_id, "emoji": emoji}
+        )
+
+    def mark_read(self, chat: str | int) -> dict[str, Any]:
+        return self._post("/mark_read", {"chat": chat})
+
     def shutdown(self, instance_id: str) -> dict[str, Any]:
         return self._post("/shutdown", {"instance_id": instance_id})

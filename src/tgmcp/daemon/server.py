@@ -234,6 +234,45 @@ class SendReq(BaseModel):
     reply_to: Optional[int] = None
 
 
+class EditReq(BaseModel):
+    chat: str | int
+    msg_id: int
+    text: str
+
+
+class DeleteReq(BaseModel):
+    chat: str | int
+    msg_ids: list[int]
+    revoke: bool = True
+
+
+class ForwardReq(BaseModel):
+    from_chat: str | int
+    to_chat: str | int
+    msg_ids: list[int]
+
+
+class PinReq(BaseModel):
+    chat: str | int
+    msg_id: int
+    notify: bool = True
+
+
+class UnpinReq(BaseModel):
+    chat: str | int
+    msg_id: Optional[int] = None
+
+
+class ReactReq(BaseModel):
+    chat: str | int
+    msg_id: int
+    emoji: Optional[str] = None  # None clears the reaction
+
+
+class MarkReadReq(BaseModel):
+    chat: str | int
+
+
 class ShutdownReq(BaseModel):
     instance_id: str
 
@@ -358,6 +397,71 @@ async def send(req: SendReq) -> dict[str, Any]:
         text_len=len(req.text),
     )
     return {"msg_id": msg_id}
+
+
+@app.post("/edit")
+async def edit(req: EditReq) -> dict[str, Any]:
+    msg_id = await _sess().edit_message(req.chat, req.msg_id, req.text)
+    audit.log("edit", chat=str(req.chat), msg_id=msg_id, text_len=len(req.text))
+    return {"msg_id": msg_id}
+
+
+@app.post("/delete")
+async def delete(req: DeleteReq) -> dict[str, Any]:
+    requested = await _sess().delete_messages(req.chat, req.msg_ids, revoke=req.revoke)
+    audit.log(
+        "delete",
+        chat=str(req.chat),
+        msg_ids=req.msg_ids,
+        revoke=req.revoke,
+        requested=requested,
+    )
+    # `requested` is the number of ids we asked Telegram to delete.
+    # Telethon raises on RPC failure, so absent an exception the request was
+    # accepted — but global-revoke is best-effort and a successful response
+    # does NOT guarantee every recipient saw the deletion.
+    return {"ok": True, "requested": requested}
+
+
+@app.post("/forward")
+async def forward(req: ForwardReq) -> dict[str, Any]:
+    new_ids = await _sess().forward_messages(req.from_chat, req.to_chat, req.msg_ids)
+    audit.log(
+        "forward",
+        from_chat=str(req.from_chat),
+        to_chat=str(req.to_chat),
+        src_msg_ids=req.msg_ids,
+        new_msg_ids=new_ids,
+    )
+    return {"msg_ids": new_ids}
+
+
+@app.post("/pin")
+async def pin(req: PinReq) -> dict[str, Any]:
+    await _sess().pin_message(req.chat, req.msg_id, notify=req.notify)
+    audit.log("pin", chat=str(req.chat), msg_id=req.msg_id, notify=req.notify)
+    return {"ok": True}
+
+
+@app.post("/unpin")
+async def unpin(req: UnpinReq) -> dict[str, Any]:
+    await _sess().unpin_message(req.chat, req.msg_id)
+    audit.log("unpin", chat=str(req.chat), msg_id=req.msg_id)
+    return {"ok": True}
+
+
+@app.post("/react")
+async def react(req: ReactReq) -> dict[str, Any]:
+    await _sess().react(req.chat, req.msg_id, req.emoji)
+    audit.log("react", chat=str(req.chat), msg_id=req.msg_id, emoji=req.emoji)
+    return {"ok": True}
+
+
+@app.post("/mark_read")
+async def mark_read(req: MarkReadReq) -> dict[str, Any]:
+    await _sess().mark_as_read(req.chat)
+    audit.log("mark_read", chat=str(req.chat))
+    return {"ok": True}
 
 
 # ---------- entry point ----------

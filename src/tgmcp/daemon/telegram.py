@@ -348,6 +348,99 @@ class TGSession:
         m = await self.client.send_message(entity, text, reply_to=reply_to)
         return m.id
 
+    async def edit_message(self, chat: str | int, msg_id: int, text: str) -> int:
+        entity = await self.client.get_entity(chat)
+        m = await self.client.edit_message(entity, msg_id, text)
+        return m.id
+
+    async def delete_messages(
+        self,
+        chat: str | int,
+        msg_ids: list[int],
+        *,
+        revoke: bool = True,
+    ) -> int:
+        """Request deletion of `msg_ids` and return the number of ids we asked
+        Telegram to delete.
+
+        We deliberately do NOT derive a "messages deleted" count from
+        Telethon's `AffectedMessages.pts_count`. That field is the size of the
+        updates-state delta, not the per-message delete count, and treating
+        it as such would silently misreport deletes. Telethon raises on RPC
+        failure; absent an exception, the request was accepted by the server.
+        Callers that need ground truth should read the chat back and confirm
+        the messages are gone.
+
+        `revoke=True` (default) ASKS Telegram to delete for everyone, matching
+        the visible behaviour of the official client. Telegram does not
+        guarantee global-revoke for every kind of message — incoming
+        non-self messages and messages older than the per-chat
+        delete-for-everyone window may only get a local delete. Treat
+        `revoke=True` as best-effort, not a hard guarantee.
+
+        `revoke=False` deletes only for the current account; copies remain in
+        other participants' chats.
+        """
+        entity = await self.client.get_entity(chat)
+        await self.client.delete_messages(entity, msg_ids, revoke=revoke)
+        return len(msg_ids)
+
+    async def forward_messages(
+        self,
+        from_chat: str | int,
+        to_chat: str | int,
+        msg_ids: list[int],
+    ) -> list[int]:
+        src = await self.client.get_entity(from_chat)
+        dst = await self.client.get_entity(to_chat)
+        forwarded = await self.client.forward_messages(dst, msg_ids, from_peer=src)
+        if not isinstance(forwarded, list):
+            forwarded = [forwarded]
+        return [m.id for m in forwarded if m is not None]
+
+    async def pin_message(
+        self,
+        chat: str | int,
+        msg_id: int,
+        *,
+        notify: bool = True,
+    ) -> bool:
+        entity = await self.client.get_entity(chat)
+        await self.client.pin_message(entity, msg_id, notify=notify)
+        return True
+
+    async def unpin_message(
+        self,
+        chat: str | int,
+        msg_id: Optional[int] = None,
+    ) -> bool:
+        """Unpin a specific message, or all if msg_id is None."""
+        entity = await self.client.get_entity(chat)
+        await self.client.unpin_message(entity, msg_id)
+        return True
+
+    async def react(
+        self,
+        chat: str | int,
+        msg_id: int,
+        emoji: Optional[str],
+    ) -> bool:
+        """Add or remove an emoji reaction. Pass emoji=None to clear."""
+        from telethon.tl.functions.messages import SendReactionRequest
+        from telethon.tl.types import ReactionEmoji
+
+        entity = await self.client.get_entity(chat)
+        reactions = [ReactionEmoji(emoticon=emoji)] if emoji else []
+        await self.client(
+            SendReactionRequest(peer=entity, msg_id=msg_id, reaction=reactions)
+        )
+        return True
+
+    async def mark_as_read(self, chat: str | int) -> bool:
+        entity = await self.client.get_entity(chat)
+        await self.client.send_read_acknowledge(entity)
+        return True
+
 
 @asynccontextmanager
 async def session_lifespan(cfg: TGConfig) -> AsyncIterator[TGSession]:
