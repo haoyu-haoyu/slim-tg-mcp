@@ -2,6 +2,88 @@
 
 All notable changes to this project follow [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-04-28
+
+Phase 3: closed the gap with chigwell/telegram-mcp by adding the
+remaining write-side coverage and the read-side enumeration tools we
+were missing.
+
+### Added — four new skills
+
+- **tg-privacy** — Read or change all 10 Telegram privacy keys
+  (status, photo, calls, forwards, chat_invite, phone, added_by_phone,
+  voice, about, p2p) with the full 6-rule grammar
+  (allow/disallow × all/contacts/users). PrivacyRule model validator
+  enforces that `*_users` rules carry a non-empty `user_ids` list and
+  that other kinds do NOT carry one (silent drop would surprise
+  callers). Audit logs the key + rule count, never the user-id
+  allowlists.
+
+- **tg-folders** — List, create-or-update, and delete chat folders
+  (Telegram dialog filters). folder_id is bounded 2..255 (Telegram
+  reserves 0/1). Title cap is the real Telegram limit of 12 UTF-8
+  chars (not 64). Model validator requires at least one inclusion
+  source so empty folders bounce here as 400 instead of as
+  FILTER_INCLUDE_EMPTY upstream.
+
+- **tg-stickers-gifs** — Saved-GIF list+send, sticker-pack list +
+  resolve-to-stickers + send. Direct GIF search is intentionally NOT
+  shipped — Telegram's user API does not expose a SearchGifs RPC
+  (that surface is via inline bots). The list→send pipeline is
+  self-consistent: every list endpoint emits the canonical
+  (doc_id, access_hash, file_reference_hex, mime_type) shape that
+  `send_gif` / `send_sticker` consume directly.
+
+- **Channel admin extension to tg-group-admin** — Five new
+  subcommands raising the skill from 8 to 13: `participants`
+  (paginated, with filter ∈ {all, admins, kicked, banned, bots,
+  search}), `signatures` (broadcast channel author signing toggle —
+  Telethon's keyword is `signatures_enabled`, not `enabled`),
+  `slow-mode` (megagroup, with the exact Telegram-allowed slot set
+  validated at the schema layer), `discussion` (bind/unbind a
+  discussion megagroup to a broadcast), and `admin-log` (admin
+  recent-events log; CHAT_ADMIN_REQUIRED if not admin).
+
+### Added — enhancements to existing skills
+
+- **tg-polls**: new `edit` subcommand. Refuses quiz polls (correct
+  answers and solution live on InputMediaPoll, not Poll, and Telegram
+  doesn't echo them back via GetMessages — silently editing a quiz
+  would drop those fields). Refuses option-count changes since votes
+  are tied to opaque option bytes.
+- **tg-scheduling**: new `edit` subcommand mirroring
+  /scheduled/send's full validation cascade — tz-aware,
+  10 s ≤ Δ ≤ 365 days, plus a just-before-dispatch recheck so the
+  request can't drift below the minimum during in-process delay.
+- **tg-profile**: new `2fa` subcommand for cloud-password (set /
+  change / remove). Passwords are read via getpass and **never
+  appear on argv**; the helper refuses to run when stdin is not a
+  TTY (getpass would silently degrade to plain reads). Audit logs
+  only the transition kind ("set" / "change" / "remove"), never any
+  password material.
+
+### Changed — server-wide
+
+- All client-side schema errors now return HTTP **400** with
+  `{"error": "ValidationError", "detail": ...}`. FastAPI's default
+  422 on body validation is mapped via a `RequestValidationError`
+  exception handler, so the CLI / skill dispatchers / DaemonClient
+  consumers can branch on a single status code.
+
+### Tests
+
+- 365 unit tests (up from 280 at v0.3.0). Each Codex review round
+  in Phase 3 closed an issue with a regression test pinning the fix.
+
+### Acknowledgments
+
+Phase 3 ran 12 additional rounds of Codex review (gpt-5.4) on top of
+the 30 Phase 1+2 already had — total 42 review iterations across the
+project. Across the three phases combined: **9 BLOCKER + 50+ MAJOR +
+30+ MINOR** issues found and fixed, every one of them with a pinned
+test.
+
+
 ## [0.3.0] - 2026-04-28
 
 Phase 2 complete: every skill from the original plan is now shipped.

@@ -56,6 +56,15 @@ def cmd_close(args, c):
     return c.poll_close(_coerce(args.chat), args.msg_id)
 
 
+def cmd_edit(args, c):
+    if args.question is None and not args.options:
+        raise SystemExit("error: pass --question and/or --options")
+    options = _split_options(args.options) if args.options else None
+    return c.poll_edit(
+        _coerce(args.chat), args.msg_id, question=args.question, options=options
+    )
+
+
 def cmd_results(args, c):
     return c.poll_results(_coerce(args.chat), args.msg_id)
 
@@ -84,10 +93,22 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--chat", required=True)
         s.add_argument("--msg-id", type=int, required=True)
 
+    e = sub.add_parser("edit")
+    e.add_argument("--chat", required=True)
+    e.add_argument("--msg-id", type=int, required=True)
+    e.add_argument("--question", default=None)
+    e.add_argument("--options", default=None,
+                   help="Comma-separated; option count must match the original")
+
     return p
 
 
-HANDLERS = {"create": cmd_create, "close": cmd_close, "results": cmd_results}
+HANDLERS = {
+    "create": cmd_create,
+    "edit": cmd_edit,
+    "close": cmd_close,
+    "results": cmd_results,
+}
 
 
 def main() -> int:

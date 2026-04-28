@@ -1373,6 +1373,45 @@ class TGSession:
             "about": new_about,
         }
 
+    async def change_2fa_password(
+        self,
+        *,
+        current_password: Optional[str],
+        new_password: Optional[str],
+        hint: str = "",
+        email: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Set, change, or remove the cloud-password (two-factor auth).
+
+        - To ENABLE 2FA on an account that has none:
+            current_password=None, new_password=<new>
+        - To CHANGE an existing password:
+            current_password=<old>, new_password=<new>
+        - To REMOVE 2FA entirely:
+            current_password=<old>, new_password=None
+
+        Telethon exposes this as `client.edit_2fa(current_password,
+        new_password, hint, email)`.
+        """
+        if not current_password and not new_password:
+            raise ValueError(
+                "edit_2fa needs at least one of current_password / new_password"
+            )
+        try:
+            ok = await self.client.edit_2fa(
+                current_password=current_password,
+                new_password=new_password,
+                hint=hint or None,
+                email=email or None,
+            )
+        finally:
+            # Wipe local references immediately. CPython doesn't promise
+            # the strings are zeroed, but at least drop our handle so they
+            # don't outlive the call.
+            current_password = None
+            new_password = None
+        return {"ok": bool(ok)}
+
     async def update_username(self, username: str) -> dict[str, Any]:
         """Set or clear the public @username. Pass empty string to clear."""
         from telethon.tl.functions.account import UpdateUsernameRequest
@@ -1441,6 +1480,31 @@ class TGSession:
             entity, text, schedule=schedule_date, reply_to=reply_to
         )
         return m.id
+
+    async def edit_scheduled(
+        self,
+        chat: str | int,
+        msg_id: int,
+        *,
+        text: Optional[str] = None,
+        schedule_date: Optional[datetime] = None,
+    ) -> int:
+        """Change the text and/or send time of a queued scheduled message.
+
+        Pass `text=None` to leave the body unchanged; pass
+        `schedule_date=None` to leave the timestamp unchanged. At least
+        one of the two must be provided.
+
+        Telethon edits a scheduled message via `client.edit_message`
+        with `schedule=` — the same path it uses for any edit.
+        """
+        if text is None and schedule_date is None:
+            raise ValueError("edit_scheduled needs at least one of text/schedule_date")
+        entity = await self.client.get_entity(chat)
+        m = await self.client.edit_message(
+            entity, msg_id, text=text, schedule=schedule_date
+        )
+        return m.id if m else msg_id
 
     async def list_scheduled(
         self, chat: str | int, *, limit: int = 100
@@ -1586,6 +1650,72 @@ class TGSession:
         entity = await self.client.get_entity(chat)
         m = await self.client.send_file(entity, media)
         return m.id
+
+    async def edit_poll(
+        self,
+        chat: str | int,
+        msg_id: int,
+        *,
+        question: Optional[str] = None,
+        options: Optional[list[str]] = None,
+    ) -> bool:
+        """Edit an existing poll's question and/or answer texts.
+
+        Telegram lets you change the human-readable text but NOT the
+        opaque option bytes — the option count must stay the same as the
+        original (changing it would invalidate every existing vote).
+
+        Pass `question=None` to keep the existing question; pass
+        `options=None` to keep the existing options.
+        """
+        import copy as _copy
+
+        from telethon.tl.functions.messages import EditMessageRequest
+        from telethon.tl.types import InputMediaPoll, PollAnswer
+
+        entity = await self.client.get_entity(chat)
+        existing = await self.client.get_messages(entity, ids=msg_id)
+        if not existing or not existing.poll:
+            raise ValueError(f"message {msg_id} in {chat} is not a poll")
+
+        # Quiz polls store `correct_answers` and `solution` on
+        # InputMediaPoll alongside the Poll object — those fields are
+        # NOT stored on the Poll itself. The original poll author knows
+        # the correct answer, but Telegram doesn't echo it back via
+        # GetMessages, so reconstructing it on edit would either be a
+        # silent loss or require the caller to re-supply it. Refusing
+        # quiz edits is the conservative path; the caller should
+        # delete + recreate instead.
+        if existing.poll.poll.quiz:
+            raise ValueError(
+                "editing quiz polls is not supported (correct_answers "
+                "would be lost). Delete the poll and create a new one."
+            )
+
+        edited_poll = _copy.copy(existing.poll.poll)
+        if question is not None:
+            edited_poll.question = question
+        if options is not None:
+            if len(options) != len(edited_poll.answers):
+                raise ValueError(
+                    f"option count must match the existing poll "
+                    f"({len(edited_poll.answers)}); got {len(options)}"
+                )
+            edited_poll.answers = [
+                # Preserve each existing option's opaque bytes — votes
+                # are tied to that, not to the displayed text.
+                PollAnswer(text=text, option=ans.option)
+                for text, ans in zip(options, edited_poll.answers)
+            ]
+
+        await self.client(
+            EditMessageRequest(
+                peer=entity,
+                id=msg_id,
+                media=InputMediaPoll(poll=edited_poll),
+            )
+        )
+        return True
 
     async def close_poll(self, chat: str | int, msg_id: int) -> bool:
         """Close a previously-sent poll so no further votes are accepted.

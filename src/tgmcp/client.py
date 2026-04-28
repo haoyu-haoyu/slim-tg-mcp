@@ -387,6 +387,24 @@ class DaemonClient:
     def profile_username(self, username: str) -> dict[str, Any]:
         return self._post("/profile/username", {"username": username})
 
+    def profile_2fa(
+        self,
+        *,
+        current_password: str | None,
+        new_password: str | None,
+        hint: str = "",
+        email: str | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/profile/2fa",
+            {
+                "current_password": current_password,
+                "new_password": new_password,
+                "hint": hint,
+                "email": email,
+            },
+        )
+
     def profile_photo(self, file_path: str) -> dict[str, Any]:
         return self._post("/profile/photo", {"file_path": file_path})
 
@@ -412,6 +430,24 @@ class DaemonClient:
                 "text": text,
                 "schedule_date": schedule_date,
                 "reply_to": reply_to,
+            },
+        )
+
+    def scheduled_edit(
+        self,
+        chat: str | int,
+        msg_id: int,
+        *,
+        text: str | None = None,
+        schedule_date: str | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/scheduled/edit",
+            {
+                "chat": chat,
+                "msg_id": msg_id,
+                "text": text,
+                "schedule_date": schedule_date,
             },
         )
 
@@ -461,6 +497,24 @@ class DaemonClient:
                 "quiz": quiz,
                 "correct_option": correct_option,
                 "explanation": explanation,
+            },
+        )
+
+    def poll_edit(
+        self,
+        chat: str | int,
+        msg_id: int,
+        *,
+        question: str | None = None,
+        options: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/poll/edit",
+            {
+                "chat": chat,
+                "msg_id": msg_id,
+                "question": question,
+                "options": options,
             },
         )
 

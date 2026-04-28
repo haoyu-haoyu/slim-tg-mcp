@@ -752,6 +752,85 @@ class PollMsgReq(BaseModel):
     msg_id: int
 
 
+class EditPollReq(BaseModel):
+    chat: str | int
+    msg_id: int
+    question: Optional[str] = Field(None, min_length=1, max_length=300)
+    options: Optional[list[str]] = Field(None, min_length=2, max_length=10)
+
+    @field_validator("options")
+    @classmethod
+    def _options_each_in_bounds(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        if v is None:
+            return v
+        for i, opt in enumerate(v):
+            if not opt.strip():
+                raise ValueError(f"option[{i}] is empty")
+            if len(opt) > 100:
+                raise ValueError(f"option[{i}] exceeds 100 chars")
+        return v
+
+    @model_validator(mode="after")
+    def _at_least_one_change(self) -> "EditPollReq":
+        if self.question is None and self.options is None:
+            raise ValueError("edit_poll needs question and/or options")
+        return self
+
+
+class EditScheduledReq(BaseModel):
+    chat: str | int
+    msg_id: int
+    text: Optional[str] = Field(None, min_length=1, max_length=4096)
+    schedule_date: Optional[datetime] = None
+
+    @field_validator("schedule_date")
+    @classmethod
+    def _tz_aware_window(cls, v: Optional[datetime]) -> Optional[datetime]:
+        """Same validation as SendScheduledReq.schedule_date — tz-aware,
+        ≥10s, ≤365 days."""
+        if v is None:
+            return v
+        from datetime import timezone as _tz
+
+        if v.tzinfo is None:
+            raise ValueError("schedule_date must be timezone-aware")
+        delta = (v - datetime.now(_tz.utc)).total_seconds()
+        if delta < 10:
+            raise ValueError(
+                f"schedule_date must be ≥10s in the future (got {delta:.1f}s)"
+            )
+        if delta > 365 * 24 * 3600:
+            raise ValueError("schedule_date must be within 365 days from now")
+        return v.astimezone(_tz.utc)
+
+    @model_validator(mode="after")
+    def _at_least_one_change(self) -> "EditScheduledReq":
+        if self.text is None and self.schedule_date is None:
+            raise ValueError("edit_scheduled needs text and/or schedule_date")
+        return self
+
+
+class Change2faReq(BaseModel):
+    """At least one of current_password / new_password must be set:
+      - both → CHANGE password
+      - only new → ENABLE 2FA on an account that had none
+      - only current → REMOVE 2FA
+    """
+
+    current_password: Optional[str] = Field(None, min_length=1, max_length=256)
+    new_password: Optional[str] = Field(None, min_length=8, max_length=256)
+    hint: str = Field("", max_length=64)
+    email: Optional[str] = Field(None, max_length=256)
+
+    @model_validator(mode="after")
+    def _at_least_one_password(self) -> "Change2faReq":
+        if not self.current_password and not self.new_password:
+            raise ValueError(
+                "change_2fa needs at least one of current_password / new_password"
+            )
+        return self
+
+
 class SendMediaReq(BaseModel):
     chat: str | int
     file_path: str
@@ -1660,6 +1739,28 @@ async def profile_update(req: UpdateProfileReq) -> dict[str, Any]:
     return info
 
 
+@app.post("/profile/2fa")
+async def profile_2fa(req: Change2faReq) -> dict[str, Any]:
+    """Change cloud-password (two-factor auth). The audit log records
+    only WHICH transition happened — set / change / remove — never the
+    passwords themselves."""
+    transition = (
+        "set"
+        if req.current_password is None and req.new_password
+        else "change"
+        if req.current_password and req.new_password
+        else "remove"
+    )
+    res = await _sess().change_2fa_password(
+        current_password=req.current_password,
+        new_password=req.new_password,
+        hint=req.hint,
+        email=req.email,
+    )
+    audit.log("profile_2fa", transition=transition)
+    return res
+
+
 @app.post("/profile/username")
 async def profile_username(req: UpdateUsernameReq) -> dict[str, Any]:
     info = await _sess().update_username(req.username)
@@ -1735,6 +1836,39 @@ async def scheduled_send(req: SendScheduledReq) -> dict[str, Any]:
     return {"ok": True, "msg_id": msg_id}
 
 
+@app.post("/scheduled/edit")
+async def scheduled_edit(req: EditScheduledReq) -> dict[str, Any]:
+    # Same just-before-dispatch recheck as /scheduled/send: a request
+    # that's borderline at parse time can age below the 10s minimum
+    # while queueing, in which case Telethon would surface a 502.
+    # Bouncing here gives callers a deterministic 400.
+    if req.schedule_date is not None:
+        from datetime import timezone as _tz
+
+        delta = (req.schedule_date - datetime.now(_tz.utc)).total_seconds()
+        if delta < 10:
+            raise HTTPException(
+                400,
+                f"schedule_date is now only {delta:.1f}s in the future; "
+                "must be ≥10s. Re-issue with a fresh timestamp.",
+            )
+
+    msg_id = await _sess().edit_scheduled(
+        req.chat,
+        req.msg_id,
+        text=req.text,
+        schedule_date=req.schedule_date,
+    )
+    audit.log(
+        "scheduled_edit",
+        chat=str(req.chat),
+        msg_id=msg_id,
+        changed_text=req.text is not None,
+        changed_schedule=req.schedule_date is not None,
+    )
+    return {"ok": True, "msg_id": msg_id}
+
+
 @app.post("/scheduled/list")
 async def scheduled_list(req: ListScheduledReq) -> dict[str, Any]:
     items = await _sess().list_scheduled(req.chat, limit=req.limit)
@@ -1796,6 +1930,22 @@ async def poll_create(req: CreatePollReq) -> dict[str, Any]:
         anonymous=req.anonymous,
     )
     return {"ok": True, "msg_id": msg_id}
+
+
+@app.post("/poll/edit")
+async def poll_edit(req: EditPollReq) -> dict[str, Any]:
+    await _sess().edit_poll(
+        req.chat, req.msg_id, question=req.question, options=req.options
+    )
+    audit.log(
+        "poll_edit",
+        chat=str(req.chat),
+        msg_id=req.msg_id,
+        # Audit records WHICH parts changed, not the new content.
+        changed_question=req.question is not None,
+        changed_options=req.options is not None,
+    )
+    return {"ok": True}
 
 
 @app.post("/poll/close")

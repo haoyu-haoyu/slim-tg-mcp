@@ -69,6 +69,20 @@ def cmd_cancel(args, c):
     return c.scheduled_delete(_coerce(args.chat), ids)
 
 
+def cmd_edit(args, c):
+    if args.text is None and args.when is None and args.in_seconds is None:
+        raise SystemExit("error: pass --text and/or --when / --in-seconds")
+    when_iso = None
+    if args.when or args.in_seconds is not None:
+        when_iso = _resolve_when(args)
+    return c.scheduled_edit(
+        _coerce(args.chat),
+        args.msg_id,
+        text=args.text,
+        schedule_date=when_iso,
+    )
+
+
 def cmd_draft_save(args, c):
     return c.draft_save(_coerce(args.chat), args.text, reply_to=args.reply_to)
 
@@ -100,6 +114,14 @@ def build_parser() -> argparse.ArgumentParser:
     cn.add_argument("--chat", required=True)
     cn.add_argument("--msg-ids", required=True, help="Comma-separated msg ids")
 
+    ed = sub.add_parser("edit")
+    ed.add_argument("--chat", required=True)
+    ed.add_argument("--msg-id", type=int, required=True)
+    ed.add_argument("--text", default=None)
+    ed.add_argument("--when", default=None,
+                    help="ISO-8601 datetime with timezone")
+    ed.add_argument("--in-seconds", type=int, default=None)
+
     ds = sub.add_parser("draft-save")
     ds.add_argument("--chat", required=True)
     ds.add_argument("--text", required=True)
@@ -116,6 +138,7 @@ HANDLERS = {
     "send": cmd_send,
     "list": cmd_list,
     "cancel": cmd_cancel,
+    "edit": cmd_edit,
     "draft-save": cmd_draft_save,
     "draft-get": cmd_draft_get,
     "draft-clear": cmd_draft_clear,

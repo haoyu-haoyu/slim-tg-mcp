@@ -113,7 +113,7 @@ def _load_skill():
 
 def test_skill_dispatcher_subcommands():
     mod = _load_skill()
-    assert set(mod.HANDLERS.keys()) == {"create", "close", "results"}
+    assert set(mod.HANDLERS.keys()) == {"create", "edit", "close", "results"}
 
 
 def test_skill_split_options_simple():

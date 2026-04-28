@@ -58,6 +58,53 @@ def cmd_offline(args, c):
     return c.profile_status(False)
 
 
+def cmd_set_2fa(args, c):
+    """Enable / change / remove cloud-password (two-factor auth).
+
+    The skill prompts for passwords interactively; they never go on
+    argv. Pass --remove to disable 2FA (asks only for the current
+    password). Pass --enable when there's no current password yet.
+    Default = change existing password (asks for both).
+
+    `getpass.getpass` requires a TTY for the prompt to actually hide
+    keystrokes; in non-interactive contexts (CI, piped stdin) it
+    degrades to plain stdin reads. For a secret-input command that's
+    too easy to misuse, so we fail fast with a clear message instead.
+    """
+    import getpass
+    import sys as _sys
+
+    if not _sys.stdin.isatty():
+        raise SystemExit(
+            "error: 2fa requires an interactive TTY for password prompts; "
+            "refusing to read passwords from a piped/non-tty stdin. Run "
+            "this command directly in a terminal."
+        )
+
+    current = None
+    new = None
+    if args.remove:
+        current = getpass.getpass("Current 2FA password: ")
+        # new stays None → disables
+    elif args.enable:
+        new = getpass.getpass("New 2FA password: ")
+        confirm = getpass.getpass("Confirm new password: ")
+        if new != confirm:
+            raise SystemExit("error: passwords do not match")
+    else:
+        current = getpass.getpass("Current 2FA password: ")
+        new = getpass.getpass("New 2FA password: ")
+        confirm = getpass.getpass("Confirm new password: ")
+        if new != confirm:
+            raise SystemExit("error: passwords do not match")
+    return c.profile_2fa(
+        current_password=current,
+        new_password=new,
+        hint=args.hint or "",
+        email=args.email,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="profile.py")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -79,6 +126,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("online")
     sub.add_parser("offline")
 
+    fa = sub.add_parser("2fa")
+    g = fa.add_mutually_exclusive_group()
+    g.add_argument("--enable", action="store_true",
+                   help="Enable 2FA on an account that has none (asks for new password only)")
+    g.add_argument("--remove", action="store_true",
+                   help="Disable 2FA (asks for current password only)")
+    fa.add_argument("--hint", default=None,
+                    help="Optional password hint stored alongside the new password")
+    fa.add_argument("--email", default=None,
+                    help="Optional recovery email")
+
     return p
 
 
@@ -89,6 +147,7 @@ HANDLERS = {
     "photo-delete": cmd_photo_delete,
     "online": cmd_online,
     "offline": cmd_offline,
+    "2fa": cmd_set_2fa,
 }
 
 

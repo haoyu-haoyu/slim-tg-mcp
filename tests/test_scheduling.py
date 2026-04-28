@@ -148,7 +148,7 @@ def _load_skill():
 
 def test_skill_handlers_registered():
     mod = _load_skill()
-    expected = {"send", "list", "cancel", "draft-save", "draft-get", "draft-clear"}
+    expected = {"send", "list", "cancel", "edit", "draft-save", "draft-get", "draft-clear"}
     assert set(mod.HANDLERS.keys()) == expected
 
 
