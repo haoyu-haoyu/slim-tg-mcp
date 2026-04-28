@@ -17,9 +17,9 @@ A slim, security-hardened **Telegram MCP server** for [Claude Code](https://clau
 The popular `chigwell/telegram-mcp` exposes **73 tools** — that's roughly
 **11 000 tokens** permanently consumed in every conversation. This project
 keeps only **8 search/read tools** as MCP and ships every write/admin
-operation as a **lazy-load Skill**. Same capabilities, **~87 % less
-context overhead**, and a security model designed from day one to survive
-prompt injection.
+operation as a **lazy-load Skill**. Same capabilities (now with feature
+parity at v0.4.0 across **11 Skills**), **~87 % less context overhead**,
+and a security model designed from day one to survive prompt injection.
 
 ### Architecture at a glance
 
@@ -30,11 +30,12 @@ prompt injection.
             │
    ┌────────┴─────────┐
    ▼                  ▼
-[Slim MCP — 8 tools]  [Skills — 8 lazy-loaded]
-  search/read           messaging / group-admin
+[Slim MCP — 8 tools]  [Skills — 11 lazy-loaded]
+  search/read           messaging / group-admin (13 ops)
   download              contacts / media-upload
-  resolve               polls / scheduling
-                        profile / export
+  resolve               polls (incl. edit) / scheduling (incl. edit)
+                        profile (incl. 2FA) / export
+                        privacy / folders / stickers-gifs
    │                  │
    └─────────┬────────┘
              ▼
@@ -48,7 +49,7 @@ prompt injection.
         Telegram
 ```
 
-### What's in the box (v0.3.0)
+### What's in the box (v0.4.0)
 
 **Always-loaded MCP tools** (~1.5 k tokens):
 
@@ -66,15 +67,21 @@ prompt injection.
 **Lazy-loaded Skills** (described, not preloaded):
 
 - `tg-messaging` — send / edit / delete / forward / pin / react / mark-read
-- `tg-group-admin` — create groups, add/kick/ban members, invite links, rename, leave
+- `tg-group-admin` — create groups, add/kick/ban, invites, rename, leave; **channel admin** (participants, signatures, slow-mode, discussion, admin-log)
 - `tg-contacts` — add (E.164 enforced), delete, block, unblock, search
 - `tg-media-upload` — send local files (photo / video / document / voice)
-- `tg-polls` — create / close / inspect (anonymous, public, multiple, quiz)
-- `tg-scheduling` — schedule, list, cancel messages + draft save/get/clear
-- `tg-profile` — update name / bio / username / photo / online status
+- `tg-polls` — create / close / inspect / **edit** (anonymous, public, multiple, quiz)
+- `tg-scheduling` — schedule / list / cancel / **edit** + draft save/get/clear
+- `tg-profile` — update name / bio / username / photo / status / **2FA** (set / change / remove)
 - `tg-export` — export chat history to local disk as JSON + media
+- `tg-privacy` — read / change all 10 privacy keys with the full 6-rule grammar
+- `tg-folders` — list / create-or-update / delete chat folders (dialog filters)
+- `tg-stickers-gifs` — saved-GIF list+send, sticker-pack list / resolve / send
 
 ### Security highlights
+
+For the full threat model see [`docs/security.md`](docs/security.md).
+Headline defenses:
 
 - **Encrypted sessions** — AES-GCM at rest, data key in OS Keychain (macOS
   Keychain / libsecret / Windows DPAPI), with scrypt-based passphrase
@@ -84,20 +91,27 @@ prompt injection.
   wrapped in `<tg_msg trust="high|medium|low">` tags with provenance.
   Forwards are automatically downgraded so an attacker can't reach
   high-trust by getting the user to forward their message.
+- **TOCTOU-resistant file ops** — all caller-supplied paths
+  (`tg-media-upload`, `tg-export`, `tg-profile photo`) go through
+  `lstat → O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC open → fstat (st_dev,
+  st_ino) match`. Telethon receives the **fd**, never the path. Export
+  uses `dir_fd`-relative ops the whole way down so the export root is
+  never re-resolved by name.
 - **Singleton daemon** — `fcntl.flock` is the authoritative liveness
   signal (kernel auto-releases on process exit). Pid-based shutdown is
   replaced with a daemon-side `/shutdown` RPC bound to a per-process
   `instance_id`; SIGTERM is only a fallback for transport failure.
 - **Path safety** — runtime artifacts (socket, lock, pid) live in
   `$XDG_RUNTIME_DIR` (validated for ownership / 0700) or `/tmp/tgmcp-<uid>`.
-  All caller-supplied filesystem paths are validated against symlinks (at
-  leaf and in every parent component), inode replacement (lstat + fstat
-  dev/ino comparison), and FIFO/device swaps (`O_NOFOLLOW|O_NONBLOCK`
-  open). Persistent paths come from `pwd.getpwuid(getuid())`, ignoring
-  `$HOME`.
+  Persistent paths come from `pwd.getpwuid(getuid())`, **ignoring `$HOME`**.
+- **Uniform 400 schema surface** — every Pydantic / model-validator
+  failure returns `400 {"error":"ValidationError", ...}`, replacing
+  FastAPI's mixed 400/422. Single status code for CLI / Skill /
+  `DaemonClient` consumers to branch on.
 - **Audit log** — every write operation appends to
   `~/.config/tgmcp/audit.log`. Sensitive content (passphrases, full
-  paths, message bodies, phone numbers) is never logged in plaintext.
+  paths, message bodies, phone numbers, 2FA passwords, privacy
+  user-id allowlists) is never logged.
 
 ### Install
 
@@ -184,7 +198,7 @@ accident; use a burner account, not your main.
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/                # 280+ unit tests
+pytest tests/                # 365 unit tests at v0.4.0
 ruff check src/ tests/
 ```
 
@@ -206,7 +220,7 @@ slim-tg-mcp/
 │   │   └── audit.py                # Append-only audit log
 │   ├── mcp_server/server.py        # 8 MCP tools (stdio)
 │   └── cli/main.py                 # `tgmcp` CLI
-├── skills/
+├── skills/                         # 11 lazy-load Skills
 │   ├── tg-messaging/
 │   ├── tg-group-admin/
 │   ├── tg-contacts/
@@ -214,11 +228,16 @@ slim-tg-mcp/
 │   ├── tg-polls/
 │   ├── tg-scheduling/
 │   ├── tg-profile/
-│   └── tg-export/
+│   ├── tg-export/
+│   ├── tg-privacy/
+│   ├── tg-folders/
+│   └── tg-stickers-gifs/
+├── docs/
+│   └── security.md                 # Full threat model
 ├── scripts/
 │   ├── smoke.sh                    # Local sanity check (no real account)
 │   └── e2e_smoke.py                # Real-account end-to-end
-└── tests/                          # 280+ unit tests
+└── tests/                          # 365 unit tests at v0.4.0
 ```
 
 ### License
@@ -235,8 +254,9 @@ model, skill split, and implementation are independent.
 
 社区里热门的 `chigwell/telegram-mcp` 暴露 **73 个工具**——也就是说每次
 对话都会**常驻消耗约 11 000 token**。本项目只把 **8 个搜索/读取工具**做
-成 MCP，把所有写入/管理操作做成 **按需加载的 Skill**。能力一致，**上下
-文开销减少约 87%**，并且从第一天起就按"防 prompt injection"思路设计。
+成 MCP，把所有写入/管理操作做成 **按需加载的 Skill**。v0.4.0 起共 **11
+个 Skill**，能力与 chigwell 全面对齐；**上下文开销减少约 87%**，并且从
+第一天起就按"防 prompt injection"思路设计。
 
 ### 架构总览
 
@@ -247,11 +267,12 @@ model, skill split, and implementation are independent.
             │
    ┌────────┴─────────┐
    ▼                  ▼
-[Slim MCP - 8 工具]  [Skills - 8 个，按需加载]
-  搜索/读取            messaging / group-admin
+[Slim MCP - 8 工具]  [Skills - 11 个，按需加载]
+  搜索/读取            messaging / group-admin (13 个子命令)
   下载                 contacts / media-upload
-  解析                 polls / scheduling
-                       profile / export
+  解析                 polls (含 edit) / scheduling (含 edit)
+                       profile (含 2FA) / export
+                       privacy / folders / stickers-gifs
    │                  │
    └─────────┬────────┘
              ▼
@@ -265,7 +286,7 @@ model, skill split, and implementation are independent.
           Telegram
 ```
 
-### 功能清单（v0.3.0）
+### 功能清单（v0.4.0）
 
 **常驻 MCP 工具**（约 1.5k tokens）：
 
@@ -283,15 +304,20 @@ model, skill split, and implementation are independent.
 **按需加载 Skill**（仅描述常驻，触发时才载入）：
 
 - `tg-messaging` — 发 / 编辑 / 删 / 转发 / 置顶 / 反应 / 已读
-- `tg-group-admin` — 建群、加/踢/封禁/解除、邀请链接、改名、退群
+- `tg-group-admin` — 建群、加/踢/封禁/解除、邀请链接、改名、退群；**频道高级管理**（成员分页、署名开关、慢速模式、绑定讨论组、admin-log）
 - `tg-contacts` — 加（强校验 E.164）/ 删 / 屏蔽 / 解除 / 搜索
 - `tg-media-upload` — 上传本地文件（图片 / 视频 / 文档 / 语音）
-- `tg-polls` — 创建 / 关闭 / 看结果（匿名、公开、多选、Quiz）
-- `tg-scheduling` — 定时消息 + 草稿管理
-- `tg-profile` — 改名字 / 简介 / 用户名 / 头像 / 在线状态
+- `tg-polls` — 创建 / 关闭 / 看结果 / **编辑**（匿名、公开、多选、Quiz）
+- `tg-scheduling` — 定时消息（含**编辑**）+ 草稿管理
+- `tg-profile` — 改名字 / 简介 / 用户名 / 头像 / 在线状态 / **2FA**（设置 / 修改 / 移除）
 - `tg-export` — 导出聊天历史为 JSON + 媒体
+- `tg-privacy` — 读取 / 修改全部 10 个隐私键（6 条规则的完整语法）
+- `tg-folders` — 列出 / 新增或更新 / 删除 对话文件夹（dialog filters）
+- `tg-stickers-gifs` — 收藏 GIF list+send，贴纸包 list / 解析 / send
 
 ### 安全特性
+
+完整威胁模型见 [`docs/security.md`](docs/security.md)，要点如下：
 
 - **会话加密**：AES-GCM 落盘，数据密钥存 OS Keychain（macOS Keychain /
   libsecret / Windows DPAPI），keychain 不可用时降级到 scrypt 加密的
@@ -300,16 +326,23 @@ model, skill split, and implementation are independent.
   见注入标记），再用 `<tg_msg trust="high|medium|low">` 包裹并附 sender
   / chat 元数据。**转发自动降权**——攻击者无法借"让用户帮我转发一下"达
   到 high trust。
+- **TOCTOU 防御**：所有调用者传入的文件路径
+  （`tg-media-upload` / `tg-export` / `tg-profile photo`）都过
+  `lstat → O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC open → fstat (st_dev,
+  st_ino) 对比`。Telethon 收到的是 **fd**，不再二次按名字解析。导出全
+  程用 `dir_fd` 相对操作，导出根目录不会被重新解析。
 - **单例 daemon**：用 `fcntl.flock` 作为权威活性信号（内核在进程退出时
   自动释放）。停止 daemon 不再依赖 SIGTERM；改用 daemon 自带 `/shutdown`
   RPC 并绑定每进程随机 `instance_id`，SIGTERM 仅作 transport 失败兜底。
 - **路径安全**：运行时产物（socket / lock / pid）放 `$XDG_RUNTIME_DIR`
-  （检查 owner / 0700）或 `/tmp/tgmcp-<uid>`。所有调用者传入的文件路径
-  都校验：父链 + 叶子的 symlink、inode 替换（lstat + fstat dev/ino 对
-  比）、FIFO/设备替换（`O_NOFOLLOW|O_NONBLOCK`）。持久路径用
+  （检查 owner / 0700）或 `/tmp/tgmcp-<uid>`。持久路径用
   `pwd.getpwuid(getuid())`，**忽略 `$HOME`**（防注入）。
+- **统一 400 校验面**：所有 Pydantic / model-validator 失败统一返回
+  `400 {"error":"ValidationError", ...}`，替代 FastAPI 默认的 400/422
+  混合。CLI / Skill / `DaemonClient` 一个状态码全搞定。
 - **审计日志**：每个写操作 append 到 `~/.config/tgmcp/audit.log`。敏感
-  内容（passphrase、绝对路径、消息正文、电话全号）从不明文记录。
+  内容（passphrase、绝对路径、消息正文、电话全号、2FA 密码材料、隐私规
+  则的 user_id 白名单）从不明文记录。
 
 ### 安装
 
@@ -393,7 +426,7 @@ TGMCP_E2E_CONFIRM=yes python scripts/e2e_smoke.py
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/                # 280+ 个单元测试
+pytest tests/                # v0.4.0 共 365 个单元测试
 ruff check src/ tests/
 ```
 
@@ -414,11 +447,13 @@ slim-tg-mcp/
 │   │   └── audit.py                # 仅追加审计日志
 │   ├── mcp_server/server.py        # 8 个 MCP 工具（stdio）
 │   └── cli/main.py                 # `tgmcp` CLI
-├── skills/                         # 8 个按需加载 Skill
+├── skills/                         # 11 个按需加载 Skill
+├── docs/
+│   └── security.md                 # 完整威胁模型
 ├── scripts/
 │   ├── smoke.sh                    # 本地 sanity check（不联网）
 │   └── e2e_smoke.py                # 真账号端到端
-└── tests/                          # 280+ 个单元测试
+└── tests/                          # v0.4.0 共 365 个单元测试
 ```
 
 ### 协议
