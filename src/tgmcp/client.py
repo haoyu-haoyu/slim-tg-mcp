@@ -548,6 +548,68 @@ class DaemonClient:
             },
         )
 
+    # ----- Forum topics -----
+
+    def topics_list(
+        self, chat: str | int, *, limit: int = 100, query: str | None = None
+    ) -> dict[str, Any]:
+        return self._post(
+            "/topics/list", {"chat": chat, "limit": limit, "query": query}
+        )
+
+    def topics_create(
+        self,
+        chat: str | int,
+        title: str,
+        *,
+        icon_color: int | None = None,
+        icon_emoji_id: int | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/topics/create",
+            {
+                "chat": chat,
+                "title": title,
+                "icon_color": icon_color,
+                "icon_emoji_id": icon_emoji_id,
+            },
+        )
+
+    def topics_edit(
+        self,
+        chat: str | int,
+        topic_id: int,
+        *,
+        title: str | None = None,
+        icon_emoji_id: int | None = None,
+        closed: bool | None = None,
+        hidden: bool | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/topics/edit",
+            {
+                "chat": chat,
+                "topic_id": topic_id,
+                "title": title,
+                "icon_emoji_id": icon_emoji_id,
+                "closed": closed,
+                "hidden": hidden,
+            },
+        )
+
+    def topics_delete(self, chat: str | int, topic_id: int) -> dict[str, Any]:
+        return self._post(
+            "/topics/delete", {"chat": chat, "topic_id": topic_id}
+        )
+
+    def topics_pin(
+        self, chat: str | int, topic_id: int, pinned: bool
+    ) -> dict[str, Any]:
+        return self._post(
+            "/topics/pin",
+            {"chat": chat, "topic_id": topic_id, "pinned": pinned},
+        )
+
     # ----- Bot mode -----
 
     def bot_send_keyboard(

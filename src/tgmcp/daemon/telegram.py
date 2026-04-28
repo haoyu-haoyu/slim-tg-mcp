@@ -1861,6 +1861,159 @@ class TGSession:
             return m[0].id if m else 0
         return m.id
 
+    # ----- Forum topics -----
+
+    async def list_topics(
+        self,
+        chat: str | int,
+        *,
+        limit: int = 100,
+        query: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """List forum topics in a forum-enabled supergroup.
+
+        `query` is a server-side substring filter on topic title; pass None
+        to list all (subject to `limit`). Telethon's GetForumTopicsRequest
+        is paginated by (offset_date, offset_id, offset_topic) — we issue a
+        single page sized at `limit`. Callers wanting more should re-call
+        with the last page's last topic id (out of scope for v1).
+        """
+        from telethon.tl.functions.messages import GetForumTopicsRequest
+
+        entity = await self.client.get_input_entity(chat)
+        result = await self.client(
+            GetForumTopicsRequest(
+                peer=entity,
+                offset_date=None,
+                offset_id=0,
+                offset_topic=0,
+                limit=max(1, min(limit, 100)),
+                q=query,
+            )
+        )
+        out: list[dict[str, Any]] = []
+        for t in getattr(result, "topics", []):
+            # Telethon returns ForumTopic OR ForumTopicDeleted; surface only
+            # live ones, the deleted variant lacks most fields.
+            if t.__class__.__name__ == "ForumTopicDeleted":
+                continue
+            out.append(
+                {
+                    "id": t.id,
+                    "title": getattr(t, "title", ""),
+                    "icon_color": getattr(t, "icon_color", None),
+                    "icon_emoji_id": getattr(t, "icon_emoji_id", None),
+                    "closed": bool(getattr(t, "closed", False)),
+                    "pinned": bool(getattr(t, "pinned", False)),
+                    "hidden": bool(getattr(t, "hidden", False)),
+                    "from_id": getattr(t, "from_id", None) and getattr(
+                        t.from_id, "user_id", None
+                    ) or getattr(t.from_id, "channel_id", None) if getattr(t, "from_id", None) else None,
+                    "top_message": getattr(t, "top_message", None),
+                    "unread_count": getattr(t, "unread_count", 0),
+                }
+            )
+        return out
+
+    async def create_topic(
+        self,
+        chat: str | int,
+        title: str,
+        *,
+        icon_color: Optional[int] = None,
+        icon_emoji_id: Optional[int] = None,
+    ) -> int:
+        """Create a new topic. Returns the new topic's id (which is also the
+        message id of the topic-create service message).
+
+        `icon_color` is a 32-bit RGB int (Telegram restricts to a small set
+        of colors; we pass through and let upstream validate).
+        `icon_emoji_id` references a custom emoji document id.
+        """
+        import secrets as _secrets
+
+        from telethon.tl.functions.messages import CreateForumTopicRequest
+
+        entity = await self.client.get_input_entity(chat)
+        result = await self.client(
+            CreateForumTopicRequest(
+                peer=entity,
+                title=title,
+                icon_color=icon_color,
+                icon_emoji_id=icon_emoji_id,
+                random_id=_secrets.randbits(63),  # Telethon needs a random id
+            )
+        )
+        # Telethon returns Updates; the new topic id is the id of the
+        # MessageActionTopicCreate service message in updates.updates.
+        for upd in getattr(result, "updates", []):
+            msg = getattr(upd, "message", None)
+            if msg is not None and msg.__class__.__name__ == "MessageService":
+                if msg.action.__class__.__name__ == "MessageActionTopicCreate":
+                    return msg.id
+        # Fallback: caller can re-list to find it.
+        return 0
+
+    async def edit_topic(
+        self,
+        chat: str | int,
+        topic_id: int,
+        *,
+        title: Optional[str] = None,
+        icon_emoji_id: Optional[int] = None,
+        closed: Optional[bool] = None,
+        hidden: Optional[bool] = None,
+    ) -> bool:
+        """Edit a topic's title / icon / closed / hidden state.
+
+        Pass None to leave a field unchanged. At least one must be set.
+        `hidden=True` is only allowed for the General topic (id=1) per
+        Telegram's rules — we let upstream raise on misuse rather than
+        re-encoding the rule client-side (it's evolved across server
+        versions).
+        """
+        from telethon.tl.functions.messages import EditForumTopicRequest
+
+        if all(x is None for x in (title, icon_emoji_id, closed, hidden)):
+            raise ValueError(
+                "edit_topic needs at least one of "
+                "title / icon_emoji_id / closed / hidden"
+            )
+        entity = await self.client.get_input_entity(chat)
+        await self.client(
+            EditForumTopicRequest(
+                peer=entity,
+                topic_id=topic_id,
+                title=title,
+                icon_emoji_id=icon_emoji_id,
+                closed=closed,
+                hidden=hidden,
+            )
+        )
+        return True
+
+    async def delete_topic(self, chat: str | int, topic_id: int) -> bool:
+        """Delete a topic (and its message history). Irreversible."""
+        from telethon.tl.functions.messages import DeleteTopicHistoryRequest
+
+        entity = await self.client.get_input_entity(chat)
+        await self.client(
+            DeleteTopicHistoryRequest(peer=entity, top_msg_id=topic_id)
+        )
+        return True
+
+    async def pin_topic(self, chat: str | int, topic_id: int, pinned: bool) -> bool:
+        """Pin (`pinned=True`) or unpin a topic."""
+        from telethon.tl.functions.messages import UpdatePinnedForumTopicRequest
+
+        entity = await self.client.get_input_entity(chat)
+        await self.client(
+            UpdatePinnedForumTopicRequest(
+                peer=entity, topic_id=topic_id, pinned=pinned
+            )
+        )
+        return True
+
     # ----- Bot-mode -----
 
     def _install_callback_handler(self) -> None:

@@ -2025,6 +2025,110 @@ async def send_media(req: SendMediaReq) -> dict[str, Any]:
     return {"ok": True, "msg_id": msg_id}
 
 
+# ---------- forum topics ----------
+
+
+class ListTopicsReq(BaseModel):
+    chat: str | int
+    limit: int = Field(100, ge=1, le=100)
+    query: Optional[str] = Field(None, max_length=64)
+
+
+class CreateTopicReq(BaseModel):
+    chat: str | int
+    title: str = Field(min_length=1, max_length=128)  # Telegram caps at 128
+    icon_color: Optional[int] = Field(None, ge=0, le=0xFFFFFF)
+    icon_emoji_id: Optional[int] = None
+
+
+class EditTopicReq(BaseModel):
+    chat: str | int
+    topic_id: int = Field(ge=1)
+    title: Optional[str] = Field(None, min_length=1, max_length=128)
+    icon_emoji_id: Optional[int] = None
+    closed: Optional[bool] = None
+    hidden: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _at_least_one(self) -> "EditTopicReq":
+        if all(x is None for x in (self.title, self.icon_emoji_id, self.closed, self.hidden)):
+            raise ValueError(
+                "edit_topic needs at least one of title / icon_emoji_id / closed / hidden"
+            )
+        return self
+
+
+class TopicReq(BaseModel):
+    chat: str | int
+    topic_id: int = Field(ge=1)
+
+
+class PinTopicReq(BaseModel):
+    chat: str | int
+    topic_id: int = Field(ge=1)
+    pinned: bool
+
+
+@app.post("/topics/list")
+async def topics_list(req: ListTopicsReq) -> dict[str, Any]:
+    items = await _sess().list_topics(req.chat, limit=req.limit, query=req.query)
+    return {"topics": items, "count": len(items)}
+
+
+@app.post("/topics/create")
+async def topics_create(req: CreateTopicReq) -> dict[str, Any]:
+    topic_id = await _sess().create_topic(
+        req.chat,
+        req.title,
+        icon_color=req.icon_color,
+        icon_emoji_id=req.icon_emoji_id,
+    )
+    audit.log("topic_create", chat=str(req.chat), topic_id=topic_id, title_len=len(req.title))
+    return {"ok": True, "topic_id": topic_id}
+
+
+@app.post("/topics/edit")
+async def topics_edit(req: EditTopicReq) -> dict[str, Any]:
+    await _sess().edit_topic(
+        req.chat,
+        req.topic_id,
+        title=req.title,
+        icon_emoji_id=req.icon_emoji_id,
+        closed=req.closed,
+        hidden=req.hidden,
+    )
+    audit.log(
+        "topic_edit",
+        chat=str(req.chat),
+        topic_id=req.topic_id,
+        fields=[
+            k for k, v in (
+                ("title", req.title),
+                ("icon", req.icon_emoji_id),
+                ("closed", req.closed),
+                ("hidden", req.hidden),
+            ) if v is not None
+        ],
+    )
+    return {"ok": True}
+
+
+@app.post("/topics/delete")
+async def topics_delete(req: TopicReq) -> dict[str, Any]:
+    await _sess().delete_topic(req.chat, req.topic_id)
+    audit.log("topic_delete", chat=str(req.chat), topic_id=req.topic_id)
+    return {"ok": True}
+
+
+@app.post("/topics/pin")
+async def topics_pin(req: PinTopicReq) -> dict[str, Any]:
+    await _sess().pin_topic(req.chat, req.topic_id, req.pinned)
+    audit.log(
+        "topic_pin", chat=str(req.chat), topic_id=req.topic_id, pinned=req.pinned
+    )
+    return {"ok": True}
+
+
 # ---------- bot mode ----------
 
 
