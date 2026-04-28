@@ -146,7 +146,14 @@ async def _open_session(label: str, passphrase: Optional[str]) -> TGSession:
         session_str = auth.load_session(label, passphrase=passphrase)
     finally:
         passphrase = None
-    cfg = TGConfig(api_id=api_id, api_hash=api_hash, session_string=session_str, label=label)
+    kind = auth.get_account_kind(label)
+    cfg = TGConfig(
+        api_id=api_id,
+        api_hash=api_hash,
+        session_string=session_str,
+        label=label,
+        is_bot=(kind == "bot"),
+    )
     sess = TGSession(cfg=cfg)
     await sess.start()
     return sess
@@ -859,6 +866,7 @@ async def health() -> dict[str, Any]:
         "instance_id": get_instance_id(),
         "account": s.cfg.label if s else None,
         "me_id": s.me_id if s else None,
+        "is_bot": bool(s.cfg.is_bot) if s else None,
         "active_label": label,
         "loaded_labels": sorted(state.sessions.keys()),
     }
@@ -866,8 +874,25 @@ async def health() -> dict[str, Any]:
 
 @app.get("/accounts")
 async def accounts() -> dict[str, Any]:
+    """List on-disk accounts with their kind ('user'/'bot').
+
+    Reading the kind requires only the envelope JSON, not decryption — so
+    we surface it freely. A label whose envelope file has been corrupted
+    (or replaced with a non-JSON blob) shows kind="unknown" rather than
+    raising; the corresponding load_session call would still surface the
+    real error.
+    """
+    labels = auth.list_accounts()
+    items = []
+    for lbl in labels:
+        try:
+            kind = auth.get_account_kind(lbl)
+        except Exception:
+            kind = "unknown"
+        items.append({"label": lbl, "kind": kind})
     return {
-        "accounts": auth.list_accounts(),
+        "accounts": labels,  # back-compat: bare list of labels
+        "items": items,
         # Same field names as /health and /accounts/switch — one shape across
         # the multi-account API surface so clients can read/cache uniformly.
         "active_label": state.active_label,
@@ -1998,6 +2023,137 @@ async def send_media(req: SendMediaReq) -> dict[str, Any]:
         **_audit_path_redacted(abs_path),
     )
     return {"ok": True, "msg_id": msg_id}
+
+
+# ---------- bot mode ----------
+
+
+class _Button(BaseModel):
+    kind: str  # "callback" | "url"
+    text: str = Field(min_length=1, max_length=64)
+    data: Optional[str] = None  # for kind="callback"; ≤64 bytes per Telegram
+    url: Optional[str] = None  # for kind="url"
+
+    @model_validator(mode="after")
+    def _check_kind(self) -> "_Button":
+        if self.kind == "callback":
+            if not self.data:
+                raise ValueError("callback buttons require non-empty data")
+            if len(self.data.encode("utf-8")) > 64:
+                raise ValueError("callback data must be ≤64 UTF-8 bytes")
+            if self.url is not None:
+                raise ValueError("callback buttons must not carry url")
+        elif self.kind == "url":
+            if not self.url:
+                raise ValueError("url buttons require non-empty url")
+            if not (self.url.startswith("https://") or self.url.startswith("tg://")):
+                raise ValueError("url must be https:// or tg://")
+            if self.data is not None:
+                raise ValueError("url buttons must not carry data")
+        else:
+            raise ValueError(f"button kind must be 'callback' or 'url', got {self.kind!r}")
+        return self
+
+
+class BotSendKeyboardReq(BaseModel):
+    chat: str | int
+    text: str = Field(min_length=1, max_length=4096)
+    rows: list[list[_Button]] = Field(min_length=1, max_length=8)
+    reply_to: Optional[int] = None
+
+    @model_validator(mode="after")
+    def _row_widths(self) -> "BotSendKeyboardReq":
+        # Telegram caps each row at 8 buttons.
+        for r in self.rows:
+            if not 1 <= len(r) <= 8:
+                raise ValueError("each keyboard row must have 1–8 buttons")
+        return self
+
+
+class BotAnswerCallbackReq(BaseModel):
+    query_id: int
+    text: str = Field("", max_length=200)  # Telegram caps callback answer text
+    alert: bool = False
+    url: Optional[str] = None
+    cache_time: int = Field(0, ge=0, le=86400)
+
+    @model_validator(mode="after")
+    def _check_url(self) -> "BotAnswerCallbackReq":
+        if self.url is not None:
+            if not self.url:
+                raise ValueError("url must be non-empty when set; pass null to omit")
+            if not (self.url.startswith("https://") or self.url.startswith("tg://")):
+                raise ValueError("url must be https:// or tg://")
+        return self
+
+
+class BotPollCallbacksReq(BaseModel):
+    timeout: float = Field(0.0, ge=0.0, le=30.0)
+    limit: int = Field(50, ge=1, le=200)
+
+
+class BotCommand(BaseModel):
+    command: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")
+    description: str = Field(min_length=1, max_length=256)
+
+
+class BotSetCommandsReq(BaseModel):
+    commands: list[BotCommand] = Field(default_factory=list, max_length=100)
+    language_code: str = Field("", max_length=8)
+
+
+def _require_bot_session() -> TGSession:
+    sess = _sess()
+    if not sess.cfg.is_bot:
+        raise HTTPException(
+            400,
+            "this endpoint requires a bot-mode session; the active account "
+            "is a user account",
+        )
+    return sess
+
+
+@app.post("/bot/send_keyboard")
+async def bot_send_keyboard(req: BotSendKeyboardReq) -> dict[str, Any]:
+    sess = _require_bot_session()
+    rows = [[b.model_dump(exclude_none=True) for b in row] for row in req.rows]
+    msg_id = await sess.bot_send_keyboard(
+        req.chat, req.text, rows, reply_to=req.reply_to
+    )
+    audit.log("bot_send_keyboard", chat=str(req.chat), msg_id=msg_id, rows=len(rows))
+    return {"ok": True, "msg_id": msg_id}
+
+
+@app.post("/bot/answer_callback")
+async def bot_answer_callback(req: BotAnswerCallbackReq) -> dict[str, Any]:
+    sess = _require_bot_session()
+    await sess.bot_answer_callback(
+        req.query_id,
+        text=req.text,
+        alert=req.alert,
+        url=req.url,
+        cache_time=req.cache_time,
+    )
+    audit.log(
+        "bot_answer_callback", query_id=req.query_id, alert=req.alert, has_text=bool(req.text)
+    )
+    return {"ok": True}
+
+
+@app.post("/bot/poll_callbacks")
+async def bot_poll_callbacks(req: BotPollCallbacksReq) -> dict[str, Any]:
+    sess = _require_bot_session()
+    items = await sess.bot_poll_callbacks(timeout=req.timeout, limit=req.limit)
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/bot/set_commands")
+async def bot_set_commands(req: BotSetCommandsReq) -> dict[str, Any]:
+    sess = _require_bot_session()
+    cmds = [c.model_dump() for c in req.commands]
+    await sess.bot_set_commands(cmds, language_code=req.language_code)
+    audit.log("bot_set_commands", count=len(cmds), lang=req.language_code or "default")
+    return {"ok": True, "count": len(cmds)}
 
 
 # ---------- entry point ----------

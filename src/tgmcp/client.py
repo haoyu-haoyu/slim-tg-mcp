@@ -547,3 +547,53 @@ class DaemonClient:
                 "force_document": force_document,
             },
         )
+
+    # ----- Bot mode -----
+
+    def bot_send_keyboard(
+        self,
+        chat: str | int,
+        text: str,
+        rows: list[list[dict[str, Any]]],
+        *,
+        reply_to: int | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/bot/send_keyboard",
+            {"chat": chat, "text": text, "rows": rows, "reply_to": reply_to},
+        )
+
+    def bot_answer_callback(
+        self,
+        query_id: int,
+        *,
+        text: str = "",
+        alert: bool = False,
+        url: str | None = None,
+        cache_time: int = 0,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/bot/answer_callback",
+            {
+                "query_id": query_id,
+                "text": text,
+                "alert": alert,
+                "url": url,
+                "cache_time": cache_time,
+            },
+        )
+
+    def bot_poll_callbacks(
+        self, *, timeout: float = 0.0, limit: int = 50
+    ) -> dict[str, Any]:
+        return self._post(
+            "/bot/poll_callbacks", {"timeout": timeout, "limit": limit}
+        )
+
+    def bot_set_commands(
+        self, commands: list[dict[str, str]], *, language_code: str = ""
+    ) -> dict[str, Any]:
+        return self._post(
+            "/bot/set_commands",
+            {"commands": commands, "language_code": language_code},
+        )

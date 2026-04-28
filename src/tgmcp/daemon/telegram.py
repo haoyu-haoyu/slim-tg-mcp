@@ -8,6 +8,7 @@ or another backend later without touching MCP/skill code.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -31,6 +32,7 @@ class TGConfig:
     api_hash: str
     session_string: str
     label: str = "main"
+    is_bot: bool = False
 
 
 @dataclass
@@ -92,6 +94,14 @@ class TGSession:
     me_id: Optional[int] = None
     contact_ids: set[int] = field(default_factory=set)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Bot-mode: bounded ring buffer of incoming CallbackQuery events. Set up
+    # only when start() detects bot mode. Kept tiny — if the LLM doesn't
+    # poll fast enough we silently drop the OLDEST events (deque with
+    # maxlen) rather than the newest, since recent presses are the
+    # actionable ones.
+    _cb_queue: deque = field(default_factory=lambda: deque(maxlen=200))
+    _cb_event: Optional[asyncio.Event] = None
+    _cb_handler: Any = None  # the registered Telethon event handler
 
     async def start(self) -> None:
         self.client = TelegramClient(
@@ -106,7 +116,22 @@ class TGSession:
             )
         me = await self.client.get_me()
         self.me_id = me.id
-        await self._refresh_contacts()
+        # Trust the envelope's declared kind, but cross-check against the
+        # server-side `me.bot` flag — a mismatch (e.g., bot-flagged envelope
+        # but Telegram says user, or vice versa) means the session was issued
+        # for a different kind than we recorded, and any RPC we route by kind
+        # will misbehave. Refuse to start.
+        actual_is_bot = bool(getattr(me, "bot", False))
+        if actual_is_bot != self.cfg.is_bot:
+            raise RuntimeError(
+                f"account kind mismatch: envelope says is_bot={self.cfg.is_bot} "
+                f"but Telegram reports is_bot={actual_is_bot}. Re-run "
+                f"`tgmcp init` with the correct flags."
+            )
+        if not self.cfg.is_bot:
+            await self._refresh_contacts()
+        else:
+            self._install_callback_handler()
 
     async def _refresh_contacts(self) -> None:
         try:
@@ -1835,6 +1860,168 @@ class TGSession:
         if isinstance(m, list):
             return m[0].id if m else 0
         return m.id
+
+    # ----- Bot-mode -----
+
+    def _install_callback_handler(self) -> None:
+        """Subscribe to Telethon's CallbackQuery events and queue them.
+
+        Only safe to call once per session. Events arrive on the loop's
+        background thread; the deque is thread-safe for append+popleft.
+        """
+        from telethon import events as _events
+
+        self._cb_event = asyncio.Event()
+
+        async def _on_callback(event: Any) -> None:
+            entry = {
+                "query_id": event.query.query_id,
+                "data": event.data.decode("utf-8", errors="replace") if event.data else "",
+                "from_user_id": event.sender_id,
+                "chat_id": event.chat_id,
+                "message_id": getattr(event.query, "msg_id", None),
+                "received_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._cb_queue.append(entry)
+            if self._cb_event is not None:
+                self._cb_event.set()
+
+        self._cb_handler = _on_callback
+        self.client.add_event_handler(_on_callback, _events.CallbackQuery())
+
+    async def bot_poll_callbacks(
+        self, *, timeout: float = 0.0, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Drain pending CallbackQuery events.
+
+        - timeout=0: return immediately (empty if queue is empty).
+        - timeout>0: wait up to `timeout` seconds for the first event, then
+          drain whatever has accumulated.
+        - At most `limit` entries returned per call (the rest stays for the
+          next poll).
+        """
+        if not self.cfg.is_bot:
+            raise ValueError("bot_poll_callbacks requires bot mode")
+        if not self._cb_queue and timeout > 0 and self._cb_event is not None:
+            try:
+                await asyncio.wait_for(self._cb_event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return []
+        out: list[dict[str, Any]] = []
+        while self._cb_queue and len(out) < limit:
+            out.append(self._cb_queue.popleft())
+        if not self._cb_queue and self._cb_event is not None:
+            self._cb_event.clear()
+        return out
+
+    async def bot_answer_callback(
+        self,
+        query_id: int,
+        *,
+        text: str = "",
+        alert: bool = False,
+        url: Optional[str] = None,
+        cache_time: int = 0,
+    ) -> bool:
+        """Acknowledge a callback query. Telegram requires this within 15
+        minutes or the user's client shows a 'loading' spinner indefinitely.
+        """
+        if not self.cfg.is_bot:
+            raise ValueError("bot_answer_callback requires bot mode")
+        from telethon.tl.functions.messages import SetBotCallbackAnswerRequest
+
+        await self.client(
+            SetBotCallbackAnswerRequest(
+                query_id=query_id,
+                alert=alert,
+                message=text or None,
+                url=url,
+                cache_time=cache_time,
+            )
+        )
+        return True
+
+    async def bot_send_keyboard(
+        self,
+        chat: str | int,
+        text: str,
+        rows: list[list[dict[str, Any]]],
+        *,
+        reply_to: Optional[int] = None,
+    ) -> int:
+        """Send `text` to `chat` with an inline keyboard.
+
+        Each row is a list of button dicts. Supported kinds:
+          - {"kind": "callback", "text": str, "data": str}
+          - {"kind": "url", "text": str, "url": str}
+
+        Telegram caps `data` at 64 bytes per button — we let upstream raise
+        on over-long values rather than silently truncating.
+        """
+        if not self.cfg.is_bot:
+            raise ValueError("bot_send_keyboard requires bot mode")
+        from telethon.tl.types import (
+            KeyboardButtonCallback,
+            KeyboardButtonUrl,
+            ReplyInlineMarkup,
+        )
+        from telethon.tl.types import KeyboardButtonRow
+
+        tl_rows = []
+        for row in rows:
+            tl_buttons = []
+            for btn in row:
+                kind = btn.get("kind")
+                if kind == "callback":
+                    tl_buttons.append(
+                        KeyboardButtonCallback(
+                            text=btn["text"],
+                            data=btn["data"].encode("utf-8")
+                            if isinstance(btn["data"], str)
+                            else btn["data"],
+                        )
+                    )
+                elif kind == "url":
+                    tl_buttons.append(
+                        KeyboardButtonUrl(text=btn["text"], url=btn["url"])
+                    )
+                else:
+                    raise ValueError(f"unsupported button kind: {kind!r}")
+            tl_rows.append(KeyboardButtonRow(buttons=tl_buttons))
+        markup = ReplyInlineMarkup(rows=tl_rows)
+
+        entity = await self.client.get_entity(chat)
+        m = await self.client.send_message(
+            entity, text, buttons=markup, reply_to=reply_to
+        )
+        return m.id
+
+    async def bot_set_commands(
+        self, commands: list[dict[str, str]], *, language_code: str = ""
+    ) -> bool:
+        """Register the bot's command list (shows in clients' '/' menu).
+
+        Each command dict: {"command": "start", "description": "Begin"}.
+        Pass an empty list to clear. `language_code` follows IETF BCP 47;
+        empty string = default for all languages.
+        """
+        if not self.cfg.is_bot:
+            raise ValueError("bot_set_commands requires bot mode")
+        from telethon.tl.functions.bots import SetBotCommandsRequest
+        from telethon.tl.types import BotCommand, BotCommandScopeDefault
+
+        tl_commands = [
+            BotCommand(command=c["command"], description=c["description"])
+            for c in commands
+        ]
+        await self.client(
+            SetBotCommandsRequest(
+                scope=BotCommandScopeDefault(),
+                lang_code=language_code,
+                commands=tl_commands,
+            )
+        )
+        return True
 
     async def search_contacts(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
         """Search the user's saved contacts.

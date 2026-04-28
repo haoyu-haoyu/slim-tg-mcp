@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import enum
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -234,6 +235,9 @@ def _collect_passphrase(
     return None
 
 
+_BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{30,}$")
+
+
 @cli.command()
 @click.option("--label", default="main", help="Account label (default: main)")
 @click.option(
@@ -247,8 +251,35 @@ def _collect_passphrase(
     is_flag=True,
     help="Read passphrase from stdin (for automation)",
 )
-def init(label: str, use_passphrase: bool, passphrase_stdin: bool) -> None:
-    """Interactive first-time Telegram login. Stores an encrypted session."""
+@click.option(
+    "--bot-token",
+    "bot_token",
+    default=None,
+    help="Login as a bot using a BotFather token. **Insecure for shared "
+    "machines** — argv is visible to other UIDs in `ps`/proc and the "
+    "value typically lands in shell history. Prefer --bot-token-stdin "
+    "(no argv exposure) or TGMCP_BOT_TOKEN (less leaky than argv but "
+    "still readable from /proc/<pid>/environ on Linux).",
+)
+@click.option(
+    "--bot-token-stdin",
+    "bot_token_stdin",
+    is_flag=True,
+    help="Read the bot token from stdin. Recommended path: the token "
+    "never enters argv or env. Takes precedence over --bot-token.",
+)
+def init(
+    label: str,
+    use_passphrase: bool,
+    passphrase_stdin: bool,
+    bot_token: Optional[str],
+    bot_token_stdin: bool,
+) -> None:
+    """Interactive first-time Telegram login. Stores an encrypted session.
+
+    With `--bot-token <token>` (or TGMCP_BOT_TOKEN env, or
+    --bot-token-stdin), logs in as a bot and skips the SMS step.
+    """
     api_id_str = os.environ.get("TG_API_ID") or click.prompt(
         "Telegram api_id (from https://my.telegram.org)", type=str
     )
@@ -267,22 +298,66 @@ def init(label: str, use_passphrase: bool, passphrase_stdin: bool) -> None:
     from telethon import TelegramClient
     from telethon.sessions import StringSession
 
-    client = TelegramClient(StringSession(), api_id, api_hash)
-    with client:
-        console.print("[green]Logged in.[/green]")
-        session_string = client.session.save()
+    bot_token_via_argv = False
+    if bot_token_stdin:
+        bot_token = sys.stdin.readline().rstrip("\n")
+    elif bot_token is not None:
+        bot_token_via_argv = True
+    else:
+        bot_token = os.environ.pop("TGMCP_BOT_TOKEN", None)
 
+    is_bot = bot_token is not None
+    if is_bot:
+        if bot_token_via_argv:
+            console.print(
+                "[yellow]warning: --bot-token was passed on argv. The token "
+                "is visible to other processes via `ps`/proc and likely "
+                "lands in your shell history. For repeat use, prefer "
+                "--bot-token-stdin or TGMCP_BOT_TOKEN.[/yellow]"
+            )
+        if not _BOT_TOKEN_RE.match(bot_token or ""):
+            console.print(
+                "[red]bot token does not look like a BotFather token "
+                "(expected '<digits>:<>=30 alphanumeric chars>')[/red]"
+            )
+            sys.exit(1)
+        client = TelegramClient(StringSession(), api_id, api_hash)
+        try:
+            client.start(bot_token=bot_token)
+            console.print("[green]Bot logged in.[/green]")
+            session_string = client.session.save()
+        finally:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            # Wipe local refs to the token immediately. CPython doesn't
+            # zero strings, but at least don't keep our handle alive.
+            bot_token = None  # noqa: F841
+    else:
+        client = TelegramClient(StringSession(), api_id, api_hash)
+        with client:
+            console.print("[green]Logged in.[/green]")
+            session_string = client.session.save()
+
+    account_kind = "bot" if is_bot else "user"
     try:
-        auth.save_session(label, session_string, passphrase=pass_value)
+        auth.save_session(
+            label, session_string, passphrase=pass_value, account_kind=account_kind
+        )
     except auth.KeychainUnavailable as e:
         console.print(f"[yellow]Keychain unavailable: {e}[/yellow]")
         console.print("[yellow]Falling back to passphrase encryption.[/yellow]")
         pass_value = click.prompt(
             "Encryption passphrase", hide_input=True, confirmation_prompt=True
         )
-        auth.save_session(label, session_string, passphrase=pass_value)
+        auth.save_session(
+            label, session_string, passphrase=pass_value, account_kind=account_kind
+        )
 
-    console.print(f"[green]Session encrypted and saved as label={label!r}.[/green]")
+    console.print(
+        f"[green]Session ({account_kind}) encrypted and saved as label={label!r}.[/green]"
+    )
     if pass_value is not None:
         console.print(
             "[yellow]Remember: you'll need this passphrase every time the daemon "

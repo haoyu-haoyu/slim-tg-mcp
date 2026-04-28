@@ -40,13 +40,20 @@ class Envelope:
     ct: str
     kdf: str  # "keychain" or "scrypt"
     salt: Optional[str] = None  # only for scrypt
+    # "user" (default — interactive SMS login) or "bot" (BotFather token).
+    # Older envelopes pre-v0.5.0 omit this; we default to "user" on read for
+    # back-compat. Authenticated as part of AESGCM AAD so an attacker can't
+    # flip the field without breaking decryption.
+    account_kind: str = "user"
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__)
 
     @classmethod
     def from_json(cls, s: str) -> "Envelope":
-        return cls(**json.loads(s))
+        d = json.loads(s)
+        d.setdefault("account_kind", "user")
+        return cls(**d)
 
 
 def _ensure_dirs() -> None:
@@ -108,13 +115,22 @@ def _scrypt_key(passphrase: str, salt: bytes) -> bytes:
     return kdf.derive(passphrase.encode("utf-8"))
 
 
+def _aad(label: str, account_kind: str) -> bytes:
+    # AAD ties the ciphertext to (label, account_kind). Flipping kind in the
+    # envelope without re-encrypting will fail GCM tag verification.
+    return f"{label}|{account_kind}".encode("utf-8")
+
+
 def save_session(
     label: str,
     session_string: str,
     *,
     passphrase: Optional[str] = None,
+    account_kind: str = "user",
 ) -> Path:
     """Encrypt and persist the session string. Returns the file path."""
+    if account_kind not in ("user", "bot"):
+        raise ValueError(f"account_kind must be 'user' or 'bot', got {account_kind!r}")
     _ensure_dirs()
     nonce = secrets.token_bytes(12)
 
@@ -128,19 +144,38 @@ def save_session(
         kdf = "scrypt"
 
     aes = AESGCM(dk)
-    ct = aes.encrypt(nonce, session_string.encode("utf-8"), label.encode("utf-8"))
+    ct = aes.encrypt(nonce, session_string.encode("utf-8"), _aad(label, account_kind))
 
     env = Envelope(
         nonce=base64.b64encode(nonce).decode(),
         ct=base64.b64encode(ct).decode(),
         kdf=kdf,
         salt=base64.b64encode(salt).decode() if salt else None,
+        account_kind=account_kind,
     )
 
     path = _session_path(label)
     path.write_text(env.to_json())
     os.chmod(path, 0o600)
     return path
+
+
+def _try_decrypt(env: Envelope, dk: bytes, label: str) -> str:
+    """Attempt decryption. For back-compat we try the new AAD first
+    ('label|kind'); if that fails AND the envelope has the default
+    account_kind, fall back to the legacy AAD ('label' only) so pre-v0.5.0
+    envelopes still open. New envelopes (kind="bot" or any future kind) only
+    accept the new AAD."""
+    aes = AESGCM(dk)
+    nonce = base64.b64decode(env.nonce)
+    ct = base64.b64decode(env.ct)
+    try:
+        pt = aes.decrypt(nonce, ct, _aad(label, env.account_kind))
+    except Exception:
+        if env.account_kind != "user":
+            raise
+        pt = aes.decrypt(nonce, ct, label.encode("utf-8"))
+    return pt.decode("utf-8")
 
 
 def load_session(label: str, *, passphrase: Optional[str] = None) -> str:
@@ -158,13 +193,14 @@ def load_session(label: str, *, passphrase: Optional[str] = None) -> str:
     else:
         raise ValueError(f"unknown kdf: {env.kdf}")
 
-    aes = AESGCM(dk)
-    pt = aes.decrypt(
-        base64.b64decode(env.nonce),
-        base64.b64decode(env.ct),
-        label.encode("utf-8"),
-    )
-    return pt.decode("utf-8")
+    return _try_decrypt(env, dk, label)
+
+
+def get_account_kind(label: str) -> str:
+    """Return the account kind ('user'|'bot') without decrypting."""
+    path = _session_path(label)
+    env = Envelope.from_json(path.read_text())
+    return env.account_kind
 
 
 def list_accounts() -> list[str]:
