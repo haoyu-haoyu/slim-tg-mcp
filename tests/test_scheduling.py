@@ -286,18 +286,20 @@ async def test_get_draft_returns_real_saved_draft():
 
     target_entity = SimpleNamespace()
 
+    # Telethon ≥1.43 DraftMessage moved `reply_to_msg_id:int` into a
+    # nested `reply_to: InputReplyToMessage` object. Mirror that here.
     async def fake_iter():
         yield SimpleNamespace(
             entity=SimpleNamespace(),  # different peer
             text="other-chat-draft",
             date=None,
-            reply_to_msg_id=None,
+            reply_to=None,
         )
         yield SimpleNamespace(
             entity=target_entity,
             text="real saved text",
             date=None,
-            reply_to_msg_id=999,
+            reply_to=SimpleNamespace(reply_to_msg_id=999),
         )
 
     class FakeClient:

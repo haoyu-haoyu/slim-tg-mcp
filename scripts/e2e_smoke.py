@@ -213,6 +213,77 @@ def run_location(c: DaemonClient, me_id: int) -> None:
     ok("deleted")
 
 
+# ---------- polls (write to Saved Messages, immediately delete) ----------
+
+
+def run_polls(c: DaemonClient, me_id: int) -> None:
+    step("polls: create → results → close → delete")
+    res = c.poll_create(
+        me_id,
+        f"e2e poll {int(time.time())}",
+        ["A", "B", "C"],
+        anonymous=True,
+    )
+    poll_id = res["msg_id"]
+    ok(f"created poll msg_id={poll_id}")
+
+    results = c.poll_results(me_id, poll_id)
+    if not isinstance(results.get("question"), str):
+        raise RuntimeError(
+            f"poll_results question not serialized as str: "
+            f"{type(results.get('question')).__name__}"
+        )
+    ok(f"results: {results.get('total_voters')} voters, "
+       f"question={results.get('question')!r}")
+
+    c.poll_close(me_id, poll_id)
+    ok("closed")
+    c.delete(me_id, [poll_id])
+    ok("deleted")
+
+
+# ---------- scheduled messages ----------
+
+
+def run_scheduled(c: DaemonClient, me_id: int) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    step("scheduled: send 60s out → list → cancel")
+    future = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
+    sres = c.scheduled_send(me_id, f"e2e scheduled {int(time.time())}", future)
+    sched_id = sres["msg_id"]
+    ok(f"scheduled msg_id={sched_id}")
+
+    listing = c.scheduled_list(me_id)
+    sched_ids = [s["id"] for s in listing.get("scheduled", [])]
+    if sched_id not in sched_ids:
+        raise RuntimeError(
+            f"scheduled_list missing our id; got {sched_ids}"
+        )
+    ok(f"listed ({len(sched_ids)} total scheduled)")
+
+    c.scheduled_delete(me_id, [sched_id])
+    ok("cancelled")
+
+
+# ---------- drafts ----------
+
+
+def run_drafts(c: DaemonClient, me_id: int) -> None:
+    step("drafts: save → get → clear")
+    c.draft_save(me_id, f"e2e draft {int(time.time())}")
+    ok("saved")
+
+    res = c.draft_get(me_id)
+    draft = res.get("draft") or {}
+    if not draft.get("text"):
+        raise RuntimeError(f"draft_get returned no draft.text: {res}")
+    ok(f"got back text={draft.get('text')!r}")
+
+    c.draft_clear(me_id)
+    ok("cleared")
+
+
 # ---------- topics (v0.5 — destructive; needs --topics-chat) ----------
 
 
@@ -359,6 +430,21 @@ def main() -> int:
         help="send a static location pin to Saved Messages and delete it",
     )
     parser.add_argument(
+        "--polls",
+        action="store_true",
+        help="poll create+results+close+delete in Saved Messages",
+    )
+    parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="scheduled message send+list+cancel in Saved Messages",
+    )
+    parser.add_argument(
+        "--drafts",
+        action="store_true",
+        help="draft save+get+clear in Saved Messages",
+    )
+    parser.add_argument(
         "--topics-chat",
         default=None,
         help="forum supergroup id/username to test against (skipped if absent)",
@@ -380,7 +466,9 @@ def main() -> int:
             "  Recommended: use a burner account, not your main one."
         )
 
-    # Default: read-only + self-only safe set
+    # Default: read-only + self-only safe set (still includes
+    # write-then-delete-in-Saved-Messages groups since those don't
+    # touch any external peer).
     if not any(
         [
             args.core,
@@ -388,6 +476,9 @@ def main() -> int:
             args.folders,
             args.stories,
             args.location,
+            args.polls,
+            args.scheduled,
+            args.drafts,
             args.topics_chat,
             args.metrics,
             args.bot,
@@ -399,6 +490,9 @@ def main() -> int:
         args.privacy = True
         args.folders = True
         args.stories = True
+        args.polls = True
+        args.scheduled = True
+        args.drafts = True
 
     if args.all:
         args.core = True
@@ -406,6 +500,9 @@ def main() -> int:
         args.folders = True
         args.stories = True
         args.location = True
+        args.polls = True
+        args.scheduled = True
+        args.drafts = True
         args.metrics = True
         args.bot = True
 
@@ -477,6 +574,24 @@ def main() -> int:
                     run_location(c, me_id)
                 except Exception as e:
                     failures.append(f"location: {type(e).__name__}: {e}")
+
+            if args.polls:
+                try:
+                    run_polls(c, me_id)
+                except Exception as e:
+                    failures.append(f"polls: {type(e).__name__}: {e}")
+
+            if args.scheduled:
+                try:
+                    run_scheduled(c, me_id)
+                except Exception as e:
+                    failures.append(f"scheduled: {type(e).__name__}: {e}")
+
+            if args.drafts:
+                try:
+                    run_drafts(c, me_id)
+                except Exception as e:
+                    failures.append(f"drafts: {type(e).__name__}: {e}")
 
             if args.topics_chat:
                 try:

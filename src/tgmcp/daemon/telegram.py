@@ -1123,10 +1123,23 @@ class TGSession:
         out = []
         for f in filters:
             if hasattr(f, "id") and getattr(f, "title", None) is not None:
+                # Title is now TypeTextWithEntities in Telethon ≥1.43
+                # (TL spec change). Extract .text for JSON serialization;
+                # fall back to str() only if the object has no .text
+                # attribute at all (legacy / unexpected shapes). An empty
+                # `.text` must surface as "" — NOT as str(obj) which
+                # would return the TL repr.
+                title_obj = f.title
+                if isinstance(title_obj, str):
+                    title_str = title_obj
+                elif hasattr(title_obj, "text"):
+                    title_str = title_obj.text or ""
+                else:
+                    title_str = str(title_obj)
                 out.append(
                     {
                         "id": f.id,
-                        "title": f.title,
+                        "title": title_str,
                         "include_count": len(getattr(f, "include_peers", []) or []),
                         "exclude_count": len(getattr(f, "exclude_peers", []) or []),
                         "pinned_count": len(getattr(f, "pinned_peers", []) or []),
@@ -1154,8 +1167,11 @@ class TGSession:
     ) -> dict[str, Any]:
         """Create or update a folder (dialog filter). Same RPC for both —
         a new id creates; an existing id replaces."""
+        # Telethon ≥1.43: DialogFilter.title is TypeTextWithEntities
+        # (same TL change as Poll.question / PollAnswer.text). Wrap the
+        # caller-supplied string here.
         from telethon.tl.functions.messages import UpdateDialogFilterRequest
-        from telethon.tl.types import DialogFilter
+        from telethon.tl.types import DialogFilter, TextWithEntities
 
         async def _resolve(items):
             return [
@@ -1165,7 +1181,7 @@ class TGSession:
 
         f = DialogFilter(
             id=folder_id,
-            title=title,
+            title=TextWithEntities(text=title, entities=[]),
             pinned_peers=[],
             include_peers=await _resolve(include_peers),
             exclude_peers=await _resolve(exclude_peers),
@@ -1604,12 +1620,18 @@ class TGSession:
         return out
 
     async def delete_scheduled(self, chat: str | int, msg_ids: list[int]) -> int:
-        """Cancel scheduled messages. Telethon's `scheduled=True` routes via
-        the messages.deleteScheduledMessages RPC, which is the right kind
-        of delete for the scheduled queue (regular delete_messages would
-        not see them)."""
-        entity = await self.client.get_entity(chat)
-        await self.client.delete_messages(entity, msg_ids, scheduled=True)
+        """Cancel scheduled messages.
+
+        Telethon ≥1.43 dropped the `scheduled=True` flag on the
+        high-level `client.delete_messages` helper. We now drop to the
+        raw `DeleteScheduledMessagesRequest` RPC, which is the correct
+        underlying call (regular delete_messages targets the chat
+        history, not the scheduled queue).
+        """
+        from telethon.tl.functions.messages import DeleteScheduledMessagesRequest
+
+        entity = await self.client.get_input_entity(chat)
+        await self.client(DeleteScheduledMessagesRequest(peer=entity, id=msg_ids))
         return len(msg_ids)
 
     async def save_draft(
@@ -1619,21 +1641,35 @@ class TGSession:
         *,
         reply_to: Optional[int] = None,
     ) -> bool:
+        # Telethon ≥1.43 replaced SaveDraftRequest's flat `reply_to_msg_id:int`
+        # with a structured `reply_to: InputReplyTo` object. Wrap the
+        # caller-supplied int into InputReplyToMessage for the simple
+        # "reply to a message" case (no quote, no foreign-peer reply,
+        # no monoforum etc.).
         from telethon.tl.functions.messages import SaveDraftRequest
+        from telethon.tl.types import InputReplyToMessage
 
         entity = await self.client.get_entity(chat)
-        await self.client(
-            SaveDraftRequest(peer=entity, message=text, reply_to_msg_id=reply_to)
-        )
+        kwargs: dict[str, Any] = {"peer": entity, "message": text}
+        if reply_to is not None:
+            kwargs["reply_to"] = InputReplyToMessage(reply_to_msg_id=reply_to)
+        await self.client(SaveDraftRequest(**kwargs))
         return True
 
     async def get_draft(self, chat: str | int) -> Optional[dict[str, Any]]:
         """Return the saved draft for `chat`, or None if none is set.
 
         `iter_drafts()` returns placeholder DraftMessage objects for chats
-        the user has merely opened — empty `text` AND no `reply_to_msg_id`
-        means there's no real draft. Treating those as "None" matches the
-        official client's UX (an empty draft isn't shown in the chat list).
+        the user has merely opened — empty `text` AND no reply_to means
+        there's no real draft. Treating those as "None" matches the
+        official client's UX (an empty draft isn't shown in the chat
+        list).
+
+        Telethon ≥1.43: DraftMessage's flat `reply_to_msg_id:int` was
+        replaced with a structured `reply_to: InputReplyTo` object. We
+        extract the integer from `reply_to.reply_to_msg_id` when the
+        object is the simple "reply to a message in the same chat" kind
+        (InputReplyToMessage).
         """
         entity = await self.client.get_entity(chat)
         target_peer_id = await self.client.get_peer_id(entity)
@@ -1646,8 +1682,17 @@ class TGSession:
                 continue
 
             text = draft.text or ""
-            reply_to = getattr(draft, "reply_to_msg_id", None)
-            if not text and not reply_to:
+            # InputReplyTo has multiple variants in Telethon 1.43:
+            # InputReplyToMessage (simple same-chat reply),
+            # InputReplyToStory, InputReplyToMonoForum, etc. Treat ANY
+            # non-None reply_to as evidence of a real draft so we don't
+            # discard structured-reply drafts created by other clients.
+            # We surface reply_to_msg_id (the common case) explicitly,
+            # but the existence check uses the wrapper object.
+            reply_to_obj = getattr(draft, "reply_to", None)
+            reply_to_msg_id = getattr(reply_to_obj, "reply_to_msg_id", None) if reply_to_obj else None
+            has_reply = reply_to_obj is not None
+            if not text and not has_reply:
                 # Placeholder for an opened-but-empty chat — not a real draft.
                 return None
             return {
@@ -1655,7 +1700,10 @@ class TGSession:
                 "date": draft.date.astimezone(timezone.utc).isoformat()
                 if draft.date
                 else None,
-                "reply_to_msg_id": reply_to,
+                "reply_to_msg_id": reply_to_msg_id,
+                "reply_to_kind": (
+                    type(reply_to_obj).__name__ if reply_to_obj else None
+                ),
             }
         return None
 
@@ -1694,6 +1742,7 @@ class TGSession:
             InputMediaPoll,
             Poll,
             PollAnswer,
+            TextWithEntities,
         )
 
         if quiz:
@@ -1706,15 +1755,24 @@ class TGSession:
                     f"correct_option {correct_option} out of range for {len(options)} options"
                 )
 
-        # Telethon expects answer.option to be unique short bytes used as
-        # internal identifiers. Use the index, encoded as bytes.
+        # Telethon ≥1.43 changed Poll.question + PollAnswer.text from `str`
+        # to `TextWithEntities` (TL spec change). Wrap caller-provided
+        # strings here. Empty entities list = plain text, no styling.
+        # Poll also gained a required `hash:int` field; we pass 0 since
+        # the server reassigns it on send.
+        question_twe = TextWithEntities(text=question, entities=[])
         answers = [
-            PollAnswer(text=text, option=bytes([i])) for i, text in enumerate(options)
+            PollAnswer(
+                text=TextWithEntities(text=text, entities=[]),
+                option=bytes([i]),
+            )
+            for i, text in enumerate(options)
         ]
         poll = Poll(
             id=0,
-            question=question,
+            question=question_twe,
             answers=answers,
+            hash=0,
             closed=False,
             public_voters=not anonymous,
             multiple_choice=multiple_choice,
@@ -1751,7 +1809,7 @@ class TGSession:
         import copy as _copy
 
         from telethon.tl.functions.messages import EditMessageRequest
-        from telethon.tl.types import InputMediaPoll, PollAnswer
+        from telethon.tl.types import InputMediaPoll, PollAnswer, TextWithEntities
 
         entity = await self.client.get_entity(chat)
         existing = await self.client.get_messages(entity, ids=msg_id)
@@ -1774,7 +1832,8 @@ class TGSession:
 
         edited_poll = _copy.copy(existing.poll.poll)
         if question is not None:
-            edited_poll.question = question
+            # Telethon ≥1.43 stores question as TextWithEntities, not str.
+            edited_poll.question = TextWithEntities(text=question, entities=[])
         if options is not None:
             if len(options) != len(edited_poll.answers):
                 raise ValueError(
@@ -1784,7 +1843,10 @@ class TGSession:
             edited_poll.answers = [
                 # Preserve each existing option's opaque bytes — votes
                 # are tied to that, not to the displayed text.
-                PollAnswer(text=text, option=ans.option)
+                PollAnswer(
+                    text=TextWithEntities(text=text, entities=[]),
+                    option=ans.option,
+                )
                 for text, ans in zip(options, edited_poll.answers)
             ]
 
@@ -1853,9 +1915,23 @@ class TGSession:
                 if idx is not None:
                     per_option_votes[idx] = r.voters
 
+        # Telethon ≥1.43: poll.question and ans.text are TextWithEntities
+        # objects. Extract .text so the response is JSON-serializable
+        # (FastAPI's encoder doesn't know about Telethon TL types).
+        # Handle empty-string payloads as "" — NOT as str(obj) repr —
+        # so a deliberately-empty question/option round-trips correctly.
+        def _extract_text(obj: Any) -> str:
+            if obj is None:
+                return ""
+            if isinstance(obj, str):
+                return obj
+            if hasattr(obj, "text"):
+                return obj.text or ""
+            return str(obj)
+
         out = {
             "msg_id": msg_id,
-            "question": poll.question,
+            "question": _extract_text(poll.question),
             "closed": poll.closed,
             "anonymous": not poll.public_voters,
             "multiple_choice": poll.multiple_choice,
@@ -1864,7 +1940,7 @@ class TGSession:
             "options": [
                 {
                     "index": i,
-                    "text": ans.text,
+                    "text": _extract_text(ans.text),
                     "votes": per_option_votes.get(i, 0),
                 }
                 for i, ans in enumerate(poll.answers)

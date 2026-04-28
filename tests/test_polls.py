@@ -291,3 +291,111 @@ def test_audit_logs_no_poll_question_or_option_text():
     assert "req.question" not in block, (
         "audit must not include the poll question text"
     )
+
+
+# ---------- Telethon 1.43 wire-format regressions ----------
+
+
+def test_create_poll_wraps_question_in_text_with_entities():
+    """Round-e2e1 BLOCKER: Telethon 1.43 changed Poll.question from str
+    to TextWithEntities. send_file would crash with a TypeError if we
+    hand it a bare string."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from tgmcp.daemon.telegram import TGConfig, TGSession
+
+    s = TGSession(cfg=TGConfig(api_id=1, api_hash="x", session_string="y"))
+
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        async def get_entity(self, _q):
+            return SimpleNamespace()
+
+        async def send_file(self, _e, media, **_kw):
+            captured["media"] = media
+            return SimpleNamespace(id=42)
+
+    s.client = FakeClient()
+    asyncio.run(s.create_poll("@x", "Tea or coffee?", ["tea", "coffee"]))
+
+    poll = captured["media"].poll
+    # question is a TextWithEntities now
+    assert hasattr(poll.question, "text")
+    assert poll.question.text == "Tea or coffee?"
+    assert poll.question.entities == []
+    # answers' text fields too
+    for ans in poll.answers:
+        assert hasattr(ans.text, "text")
+        assert hasattr(ans.text, "entities")
+    assert [a.text.text for a in poll.answers] == ["tea", "coffee"]
+    # Poll requires hash field in 1.43
+    assert poll.hash == 0
+
+
+def test_save_draft_uses_input_reply_to_message():
+    """Round-e2e1 BLOCKER: SaveDraftRequest dropped reply_to_msg_id;
+    the new field is reply_to: InputReplyToMessage (or other variants)."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from tgmcp.daemon.telegram import TGConfig, TGSession
+
+    s = TGSession(cfg=TGConfig(api_id=1, api_hash="x", session_string="y"))
+
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        async def get_entity(self, _q):
+            return SimpleNamespace()
+
+        def __call__(self, req):
+            captured["req"] = req
+
+            async def _coro():
+                return SimpleNamespace()
+
+            return _coro()
+
+    s.client = FakeClient()
+    asyncio.run(s.save_draft("@x", "draft text", reply_to=42))
+
+    req = captured["req"]
+    # The InputReplyToMessage object carries the int internally.
+    assert req.reply_to.__class__.__name__ == "InputReplyToMessage"
+    assert req.reply_to.reply_to_msg_id == 42
+
+
+def test_save_draft_omits_reply_to_when_none():
+    """Calling save_draft without a reply_to must NOT pass reply_to=None
+    explicitly — the field is now an object type and Telethon may not
+    accept None there."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from tgmcp.daemon.telegram import TGConfig, TGSession
+
+    s = TGSession(cfg=TGConfig(api_id=1, api_hash="x", session_string="y"))
+
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        async def get_entity(self, _q):
+            return SimpleNamespace()
+
+        def __call__(self, req):
+            captured["req"] = req
+
+            async def _coro():
+                return SimpleNamespace()
+
+            return _coro()
+
+    s.client = FakeClient()
+    asyncio.run(s.save_draft("@x", "draft text"))
+
+    req = captured["req"]
+    # In Telethon, omitted optional fields default to None on the object.
+    # We only care that we didn't try to pass an int as reply_to_msg_id.
+    assert getattr(req, "reply_to", None) is None
