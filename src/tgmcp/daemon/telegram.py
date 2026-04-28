@@ -689,6 +689,126 @@ class TGSession:
         await self.client(UnblockRequest(id=user_entity))
         return True
 
+    # ----- Stickers + GIFs (Phase 3 batch 3) -----
+
+    async def get_saved_gifs(self) -> list[dict[str, Any]]:
+        """User's saved GIFs (the heart-tabbed ones).
+
+        Output shape matches what `send_gif` consumes — every entry
+        includes the full (doc_id, access_hash, file_reference_hex)
+        triple so the caller can list-then-send without an extra
+        round-trip. Round-3 review caught the original output missing
+        `file_reference_hex`, breaking the list→send flow.
+        """
+        from telethon.tl.functions.messages import GetSavedGifsRequest
+
+        result = await self.client(GetSavedGifsRequest(hash=0))
+        gifs = getattr(result, "gifs", None) or []
+        out = []
+        for doc in gifs:
+            ref = getattr(doc, "file_reference", None)
+            out.append(
+                {
+                    "doc_id": doc.id,
+                    "access_hash": doc.access_hash,
+                    "file_reference_hex": ref.hex()
+                    if isinstance(ref, (bytes, bytearray))
+                    else None,
+                    "mime_type": getattr(doc, "mime_type", None),
+                }
+            )
+        return out
+
+    async def send_gif(
+        self, chat: str | int, doc_id: int, access_hash: int, file_reference_hex: str
+    ) -> int:
+        """Send a previously-found GIF to `chat` by document reference."""
+        from telethon.tl.types import InputDocument
+
+        try:
+            file_ref = bytes.fromhex(file_reference_hex)
+        except ValueError as e:
+            raise ValueError(f"file_reference_hex is not valid hex: {e}") from e
+        entity = await self.client.get_entity(chat)
+        input_doc = InputDocument(
+            id=doc_id, access_hash=access_hash, file_reference=file_ref
+        )
+        m = await self.client.send_file(entity, input_doc)
+        return m.id
+
+    async def get_saved_stickers(self) -> list[dict[str, Any]]:
+        """List the user's installed sticker SETS (packs).
+
+        These are PACK descriptors, not individual stickers. To get the
+        sendable per-sticker triple (doc_id, access_hash, file_reference_hex)
+        for a specific pack, pass the (set_id, access_hash) returned here
+        to `get_sticker_set`.
+        """
+        from telethon.tl.functions.messages import GetAllStickersRequest
+
+        result = await self.client(GetAllStickersRequest(hash=0))
+        sets = getattr(result, "sets", None) or []
+        out = []
+        for s in sets:
+            out.append(
+                {
+                    "set_id": s.id,
+                    "access_hash": s.access_hash,
+                    "title": getattr(s, "title", ""),
+                    "short_name": getattr(s, "short_name", ""),
+                    "count": getattr(s, "count", 0),
+                }
+            )
+        return out
+
+    async def get_sticker_set(
+        self, set_id: int, access_hash: int
+    ) -> list[dict[str, Any]]:
+        """Resolve a sticker pack to its individual sticker documents,
+        each with the (doc_id, access_hash, file_reference_hex) triple
+        that `send_sticker` consumes."""
+        from telethon.tl.functions.messages import GetStickerSetRequest
+        from telethon.tl.types import InputStickerSetID
+
+        result = await self.client(
+            GetStickerSetRequest(
+                stickerset=InputStickerSetID(id=set_id, access_hash=access_hash),
+                hash=0,
+            )
+        )
+        docs = getattr(result, "documents", None) or []
+        out = []
+        for doc in docs:
+            ref = getattr(doc, "file_reference", None)
+            out.append(
+                {
+                    "doc_id": doc.id,
+                    "access_hash": doc.access_hash,
+                    "file_reference_hex": ref.hex()
+                    if isinstance(ref, (bytes, bytearray))
+                    else None,
+                    "mime_type": getattr(doc, "mime_type", None),
+                }
+            )
+        return out
+
+    async def send_sticker(
+        self, chat: str | int, doc_id: int, access_hash: int, file_reference_hex: str
+    ) -> int:
+        """Send a sticker by document reference (same shape as send_gif)."""
+        from telethon.tl.types import InputDocument
+
+        try:
+            file_ref = bytes.fromhex(file_reference_hex)
+        except ValueError as e:
+            raise ValueError(f"file_reference_hex is not valid hex: {e}") from e
+        entity = await self.client.get_entity(chat)
+        input_doc = InputDocument(
+            id=doc_id, access_hash=access_hash, file_reference=file_ref
+        )
+        m = await self.client.send_file(entity, input_doc)
+        return m.id
+
     # ----- Channel admin (Phase 3) -----
 
     async def get_participants(

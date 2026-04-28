@@ -208,6 +208,53 @@ class DaemonClient:
     def contact_search(self, query: str, limit: int = 20) -> dict[str, Any]:
         return self._post("/contacts/search", {"query": query, "limit": limit})
 
+    # ----- stickers + gifs -----
+
+    def gif_saved(self) -> dict[str, Any]:
+        return self._get("/gif/saved")
+
+    def gif_send(
+        self,
+        chat: str | int,
+        doc_id: int,
+        access_hash: int,
+        file_reference_hex: str,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/gif/send",
+            {
+                "chat": chat,
+                "doc_id": doc_id,
+                "access_hash": access_hash,
+                "file_reference_hex": file_reference_hex,
+            },
+        )
+
+    def sticker_saved(self) -> dict[str, Any]:
+        return self._get("/sticker/saved")
+
+    def sticker_set(self, set_id: int, access_hash: int) -> dict[str, Any]:
+        return self._post(
+            "/sticker/set", {"set_id": set_id, "access_hash": access_hash}
+        )
+
+    def sticker_send(
+        self,
+        chat: str | int,
+        doc_id: int,
+        access_hash: int,
+        file_reference_hex: str,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/sticker/send",
+            {
+                "chat": chat,
+                "doc_id": doc_id,
+                "access_hash": access_hash,
+                "file_reference_hex": file_reference_hex,
+            },
+        )
+
     # ----- channel admin -----
 
     def chat_participants(

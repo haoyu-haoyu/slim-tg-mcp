@@ -419,6 +419,36 @@ VOICE_EXTS = {".ogg", ".oga", ".opus", ".mp3", ".m4a"}
 _USERNAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{3,30}[a-zA-Z0-9]$")
 
 
+class SearchGifsReq(BaseModel):
+    query: str = Field(..., min_length=1, max_length=200)
+    limit: int = Field(20, ge=1, le=50)
+
+
+class StickerSetReq(BaseModel):
+    set_id: int
+    access_hash: int
+
+
+class SendDocByRefReq(BaseModel):
+    """Used by both /gif/send and /sticker/send. The caller passes the
+    triple from a prior search/listing — the daemon never accepts a
+    raw file path here (that path goes through tg-media-upload)."""
+
+    chat: str | int
+    doc_id: int
+    access_hash: int
+    file_reference_hex: str = Field(..., min_length=1, max_length=512)
+
+    @field_validator("file_reference_hex")
+    @classmethod
+    def _valid_hex(cls, v: str) -> str:
+        try:
+            bytes.fromhex(v)
+        except ValueError as e:
+            raise ValueError(f"file_reference_hex must be hex: {e}") from e
+        return v
+
+
 class GetParticipantsReq(BaseModel):
     chat: str | int
     limit: int = Field(100, ge=1, le=1000)
@@ -1457,6 +1487,52 @@ async def export_chat(req: ExportChatReq) -> dict[str, Any]:
         include_media=req.include_media,
     )
     return res
+
+
+# ---------- Stickers + GIFs (Phase 3) ----------
+
+
+# Note on GIF search: Telegram's user API (and Telethon ≥1.36) does not
+# expose a direct "search the GIF index" RPC; that surface is delivered
+# via inline bots (e.g. @gif), which is a different request shape. We
+# only ship saved-GIF list + send here. A future skill can wrap the
+# inline-bot path if/when there's demand.
+
+
+@app.get("/gif/saved")
+async def gif_saved() -> dict[str, Any]:
+    return {"gifs": await _sess().get_saved_gifs()}
+
+
+@app.post("/gif/send")
+async def gif_send(req: SendDocByRefReq) -> dict[str, Any]:
+    msg_id = await _sess().send_gif(
+        req.chat, req.doc_id, req.access_hash, req.file_reference_hex
+    )
+    audit.log("gif_send", chat=str(req.chat), msg_id=msg_id, doc_id=req.doc_id)
+    return {"ok": True, "msg_id": msg_id}
+
+
+@app.get("/sticker/saved")
+async def sticker_saved() -> dict[str, Any]:
+    return {"sets": await _sess().get_saved_stickers()}
+
+
+@app.post("/sticker/set")
+async def sticker_set(req: StickerSetReq) -> dict[str, Any]:
+    """Resolve a sticker pack id+access_hash to its sendable stickers."""
+    return {
+        "stickers": await _sess().get_sticker_set(req.set_id, req.access_hash)
+    }
+
+
+@app.post("/sticker/send")
+async def sticker_send(req: SendDocByRefReq) -> dict[str, Any]:
+    msg_id = await _sess().send_sticker(
+        req.chat, req.doc_id, req.access_hash, req.file_reference_hex
+    )
+    audit.log("sticker_send", chat=str(req.chat), msg_id=msg_id, doc_id=req.doc_id)
+    return {"ok": True, "msg_id": msg_id}
 
 
 # ---------- Channels (Phase 3) ----------
