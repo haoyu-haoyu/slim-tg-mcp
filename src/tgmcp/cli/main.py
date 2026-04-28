@@ -307,12 +307,34 @@ def account() -> None:
 
 @account.command("list")
 def account_list() -> None:
+    """List on-disk accounts. If a daemon is running, also marks the
+    currently-active label and which sessions are loaded."""
     accounts = auth.list_accounts()
     if not accounts:
         console.print("[yellow]No accounts. Run `tgmcp init` first.[/yellow]")
         return
+
+    active: Optional[str] = None
+    loaded: list[str] = []
+    try:
+        from ..client import DaemonClient
+
+        with DaemonClient(timeout=2.0) as c:
+            payload = c.accounts()
+        active = payload.get("active_label")
+        loaded = payload.get("loaded_labels", []) or []
+    except Exception:
+        # Daemon not running — that's fine, we still list on-disk accounts.
+        pass
+
     for a in accounts:
-        console.print(f"  - {a}")
+        marks = []
+        if a == active:
+            marks.append("[bold green]active[/bold green]")
+        elif a in loaded:
+            marks.append("[dim]loaded[/dim]")
+        suffix = f" ({', '.join(marks)})" if marks else ""
+        console.print(f"  - {a}{suffix}")
 
 
 @account.command("add")
@@ -336,6 +358,56 @@ def account_remove(label: str) -> None:
         console.print(f"[green]Removed {label}[/green]")
     else:
         console.print(f"[yellow]No such account: {label}[/yellow]")
+
+
+@account.command("use")
+@click.argument("label")
+@click.option(
+    "--passphrase",
+    "use_passphrase",
+    is_flag=True,
+    help="Prompt for the session passphrase (only needed for accounts "
+    "encrypted with `tgmcp init --passphrase`).",
+)
+@click.option(
+    "--passphrase-stdin",
+    is_flag=True,
+    help="Read passphrase from stdin instead of prompting.",
+)
+def account_use(label: str, use_passphrase: bool, passphrase_stdin: bool) -> None:
+    """Switch the running daemon to use account <label>.
+
+    Requires the daemon to be running. Loads the session lazily on first
+    switch and caches it server-side; subsequent switches are instant.
+    """
+    if label not in auth.list_accounts():
+        console.print(f"[red]No such on-disk account: {label!r}[/red]")
+        sys.exit(1)
+
+    pass_value = _collect_passphrase(use_passphrase, passphrase_stdin, confirm=False)
+
+    try:
+        from ..client import DaemonClient
+
+        with DaemonClient(timeout=10.0) as c:
+            res = c.switch_account(label, passphrase=pass_value)
+    except Exception as e:
+        console.print(f"[red]Switch failed ({type(e).__name__}: {e}). "
+                      "Is the daemon running? `tgmcp daemon start`.[/red]")
+        sys.exit(1)
+    finally:
+        # Drop our reference to the passphrase ASAP.
+        pass_value = None
+
+    if res.get("ok"):
+        loaded = ", ".join(res.get("loaded_labels", []))
+        console.print(
+            f"[green]Active account → {res.get('active_label')} "
+            f"(me_id={res.get('me_id')}, loaded=[{loaded}])[/green]"
+        )
+    else:
+        console.print(f"[red]Switch did not succeed: {res}[/red]")
+        sys.exit(1)
 
 
 # ---------- daemon ----------

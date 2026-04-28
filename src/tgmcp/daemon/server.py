@@ -61,8 +61,17 @@ from .paths import LOCK_PATH, SOCKET_PATH  # noqa: E402,F401  re-exported
 
 
 class _State:
-    session: Optional[TGSession] = None
+    # Multi-account: lazy-loaded sessions keyed by account label. The active
+    # label points at whichever session subsequent requests should use.
+    sessions: dict[str, TGSession] = {}
+    active_label: Optional[str] = None
     uvicorn_server: Optional["uvicorn.Server"] = None
+    # Per-label asyncio locks to serialize concurrent loads of the same
+    # account. Without this, two `/accounts/switch` calls racing on the same
+    # cold label could both `await _open_session(...)`; the later assignment
+    # would overwrite the first live TGSession, leaving the first
+    # unreachable (and so never stopped by lifespan teardown).
+    load_locks: dict[str, "asyncio.Lock"] = {}
 
 
 state = _State()
@@ -121,25 +130,43 @@ def _read_app_creds() -> tuple[int, str]:
     return int(api_id), api_hash
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
-    label = os.environ.get("TGMCP_ACCOUNT", "main")
+async def _open_session(label: str, passphrase: Optional[str]) -> TGSession:
+    """Decrypt the on-disk session and bring up a connected TGSession.
+
+    Caller passes `passphrase` only for accounts encrypted with --passphrase
+    (keychain mode auto-resolves). The local reference is wiped right after
+    `auth.load_session` succeeds — we never keep the decrypted secret in
+    scope longer than necessary.
+    """
     api_id, api_hash = _read_app_creds()
-    passphrase = _consume_passphrase()
     try:
         session_str = auth.load_session(label, passphrase=passphrase)
     finally:
-        # Best-effort wipe of the local reference. CPython doesn't guarantee
-        # GC, but we at least drop our reference promptly.
         passphrase = None
     cfg = TGConfig(api_id=api_id, api_hash=api_hash, session_string=session_str, label=label)
-    state.session = TGSession(cfg=cfg)
-    await state.session.start()
+    sess = TGSession(cfg=cfg)
+    await sess.start()
+    return sess
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
+    label = os.environ.get("TGMCP_ACCOUNT", "main")
+    passphrase = _consume_passphrase()
+    sess = await _open_session(label, passphrase)
+    state.sessions[label] = sess
+    state.active_label = label
     try:
         yield
     finally:
-        if state.session:
-            await state.session.stop()
+        # Stop every session we ever loaded, not just the active one.
+        for s in list(state.sessions.values()):
+            try:
+                await s.stop()
+            except Exception:
+                pass
+        state.sessions.clear()
+        state.active_label = None
 
 
 app = FastAPI(title="slim-tg-mcp daemon", lifespan=lifespan)
@@ -176,9 +203,10 @@ async def _handle_any(_req: Request, exc: Exception) -> JSONResponse:
 
 
 def _sess() -> TGSession:
-    if state.session is None:
+    label = state.active_label
+    if not label or label not in state.sessions:
         raise HTTPException(503, "session not ready")
-    return state.session
+    return state.sessions[label]
 
 
 # ---------- request schemas ----------
@@ -277,12 +305,18 @@ class ShutdownReq(BaseModel):
     instance_id: str
 
 
+class SwitchAccountReq(BaseModel):
+    label: str
+    passphrase: Optional[str] = None  # only required for --passphrase accounts
+
+
 # ---------- routes ----------
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    s = state.session
+    label = state.active_label
+    s = state.sessions.get(label) if label else None
     return {
         "ok": s is not None,
         # The daemon publishes its own pid so a launching parent can verify it
@@ -295,12 +329,65 @@ async def health() -> dict[str, Any]:
         "instance_id": get_instance_id(),
         "account": s.cfg.label if s else None,
         "me_id": s.me_id if s else None,
+        "active_label": label,
+        "loaded_labels": sorted(state.sessions.keys()),
     }
 
 
 @app.get("/accounts")
-async def accounts() -> dict[str, list[str]]:
-    return {"accounts": auth.list_accounts()}
+async def accounts() -> dict[str, Any]:
+    return {
+        "accounts": auth.list_accounts(),
+        # Same field names as /health and /accounts/switch — one shape across
+        # the multi-account API surface so clients can read/cache uniformly.
+        "active_label": state.active_label,
+        "loaded_labels": sorted(state.sessions.keys()),
+    }
+
+
+@app.post("/accounts/switch")
+async def switch_account(req: SwitchAccountReq) -> dict[str, Any]:
+    """Make `req.label` the active session for subsequent requests.
+
+    Loads the session lazily on first switch and caches it in state.sessions
+    so repeat switches between accounts don't pay the auth/connect cost
+    again. The decrypted passphrase is wiped from the local frame as soon
+    as `auth.load_session` returns; it's never logged.
+    """
+    if req.label not in auth.list_accounts():
+        raise HTTPException(404, f"unknown account label: {req.label!r}")
+
+    if req.label not in state.sessions:
+        # Serialize concurrent loads of the same label so we never start two
+        # TGSession objects pointing at the same account. The first awaiter
+        # opens; the second awaiter sees the cached session after the lock
+        # releases (re-check inside the critical section).
+        lock = state.load_locks.setdefault(req.label, asyncio.Lock())
+        async with lock:
+            if req.label not in state.sessions:
+                try:
+                    sess = await _open_session(req.label, req.passphrase)
+                except Exception:
+                    # Failed load: don't cache anything; let a subsequent
+                    # caller retry with possibly-different passphrase. Wipe
+                    # the request body's secret on the way out.
+                    req.passphrase = None
+                    raise
+                state.sessions[req.label] = sess
+        # Don't keep the request body around — pydantic holds the passphrase
+        # as a model field which would otherwise outlive the call.
+        req.passphrase = None
+
+    state.active_label = req.label
+    audit.log("account_switch", label=req.label)  # NOTE: passphrase is never logged
+    s = state.sessions[req.label]
+    return {
+        "ok": True,
+        # Standardized field names across /health, /accounts, /accounts/switch.
+        "active_label": req.label,
+        "loaded_labels": sorted(state.sessions.keys()),
+        "me_id": s.me_id,
+    }
 
 
 @app.post("/search/global")

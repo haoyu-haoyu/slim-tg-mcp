@@ -117,3 +117,12 @@ class DaemonClient:
 
     def shutdown(self, instance_id: str) -> dict[str, Any]:
         return self._post("/shutdown", {"instance_id": instance_id})
+
+    def accounts(self) -> dict[str, Any]:
+        return self._get("/accounts")
+
+    def switch_account(self, label: str, passphrase: str | None = None) -> dict[str, Any]:
+        return self._post(
+            "/accounts/switch",
+            {"label": label, "passphrase": passphrase},
+        )
