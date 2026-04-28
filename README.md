@@ -115,6 +115,14 @@ Headline defenses:
 
 ### Install
 
+From PyPI (recommended):
+
+```bash
+pip install slim-tg-mcp
+```
+
+Or from source (for hacking on it):
+
 ```bash
 git clone https://github.com/haoyu-haoyu/slim-tg-mcp.git
 cd slim-tg-mcp
@@ -345,6 +353,14 @@ model, skill split, and implementation are independent.
   则的 user_id 白名单）从不明文记录。
 
 ### 安装
+
+PyPI（推荐）：
+
+```bash
+pip install slim-tg-mcp
+```
+
+源码（如果想改代码）：
 
 ```bash
 git clone https://github.com/haoyu-haoyu/slim-tg-mcp.git
