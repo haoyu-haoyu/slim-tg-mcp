@@ -2,6 +2,83 @@
 
 All notable changes to this project follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-04-28
+
+Patch release. Fixes 8 Telethon 1.43 API drift bugs found during the
+first real-account end-to-end run after v0.5.0. Anyone on the
+v0.5.0 PyPI artifact will hit these on real RPC — recommended
+upgrade for everyone using polls / drafts / scheduled messages /
+folders.
+
+### Fixed — Telethon 1.43 API mismatches
+
+Each item below is a wrapper that crashed against live Telegram
+because the TL spec moved fields between v1.36 (when v0.4 / v0.5
+were authored against) and 1.43 (current). All caught by the
+real-account e2e on 2026-04-28; all pinned by regression tests.
+
+- **`Poll(...)` requires `hash:int`** — added `hash=0`.
+- **`Poll.question` and `PollAnswer.text` are `TextWithEntities`**,
+  not `str`. Caller-supplied strings now wrapped at the wire layer
+  in both `create_poll` and `edit_poll`.
+- **`SaveDraftRequest.reply_to_msg_id:int` was replaced with
+  `reply_to: InputReplyTo`** — `save_draft` now constructs an
+  `InputReplyToMessage(reply_to_msg_id=N)` for the simple case and
+  omits the field entirely if no reply target is set.
+- **`DraftMessage.reply_to_msg_id` moved into nested
+  `reply_to.reply_to_msg_id`** — `get_draft` extracts from the
+  nested object. Treats any non-None `reply_to` (including
+  non-message variants like `InputReplyToStory`) as evidence of a
+  real draft so structured-reply drafts created by other clients
+  aren't silently dropped. Surfaces `reply_to_kind` in the response.
+- **`client.delete_messages(scheduled=True)` was removed** — replaced
+  with the raw `DeleteScheduledMessagesRequest` RPC (which is what
+  the helper used to call internally).
+- **`DialogFilter.title` is `TextWithEntities`** — `update_folder`
+  wraps the caller's string before issuing
+  `UpdateDialogFilterRequest`.
+- **`poll_results` returned a `TextWithEntities` object on
+  `question` and each option's `text`** which FastAPI couldn't
+  serialize → 400. Both now extract `.text` to a plain string.
+  Empty `.text` round-trips as `""`, not the TL object's repr.
+- **`list_folders` returned a `TextWithEntities` title** — same
+  extraction with the same empty-string handling.
+
+### Changed
+
+- **`telethon>=1.36,<2.0` → `telethon>=1.43,<2.0`**. The fixes
+  above ALL assume 1.43+ shapes; on older Telethons they'd fail in
+  the opposite direction. Pinning prevents both directions.
+
+### Added — operational
+
+- **`scripts/e2e_smoke.py` rewritten** as a flag-driven test
+  harness: `--core / --privacy / --folders / --stories / --location
+  / --polls / --scheduled / --drafts / --topics-chat / --metrics
+  / --bot / --all`. Default safe set runs read-only + Saved-Messages
+  groups. Group-level failures isolate so one broken endpoint
+  doesn't abort the run. `.env.e2e` autoloading lets you launch from
+  an IDE without exporting env vars. `--help` works without the
+  `TGMCP_E2E_CONFIRM` gate.
+- **`docs/e2e-validation.md`** — burner-account setup, run modes,
+  expected output, reporting protocol for real-account regressions.
+- **`docs/release.md` + `.github/workflows/publish.yml`** — PyPI
+  Trusted Publishing (OIDC) setup. Future releases ship via
+  `git tag vX.Y.Z` with no API token in the loop.
+
+### Tests
+
+- 516 unit tests (up from 501 at v0.5.0). 12 new regression tests
+  pin every Telethon 1.43 fix above.
+
+### Acknowledgments
+
+Codex review caught two MINOR refinements in this batch
+(`get_draft`'s blind spot for non-message reply variants, and
+empty-string repr fallback in the text extractors) — both fixed
+with regression tests.
+
+
 ## [0.5.0] - 2026-04-28
 
 Phase 4: closed remaining gaps with chigwell/telegram-mcp by adding

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "slim-tg-mcp"
-version = "0.5.0"
+version = "0.5.1"
 description = "Slim Telegram MCP server with skill-based lazy loading, encrypted sessions, and prompt-injection defense"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,7 +19,12 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "telethon>=1.36,<2.0",
+    # Tightened from >=1.36 in 0.5.1: poll/draft/scheduled/folder
+    # wrappers depend on the TextWithEntities + InputReplyTo TL types
+    # introduced in Telethon 1.43. On older Telethons several wrappers
+    # raise TypeError on real RPC. Real-account e2e from v0.5.1 release
+    # caught this; see CHANGELOG.
+    "telethon>=1.43,<2.0",
     "mcp>=1.2.0",
     "fastapi>=0.110",
     "uvicorn>=0.29",
