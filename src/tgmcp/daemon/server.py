@@ -2025,6 +2025,113 @@ async def send_media(req: SendMediaReq) -> dict[str, Any]:
     return {"ok": True, "msg_id": msg_id}
 
 
+# ---------- geo / live location ----------
+
+# Telegram's documented live-location range: any duration from 60 s
+# (1 min) to 86400 s (24 h). 0x7FFFFFFF is the sentinel for "indefinite,
+# until manually stopped" (per current Bot API docs). Anything else is
+# rejected by Telegram upstream.
+LIVE_PERIOD_MIN = 60
+LIVE_PERIOD_MAX = 86400
+LIVE_PERIOD_INDEFINITE = 0x7FFFFFFF
+
+
+class LatLng(BaseModel):
+    lat: float = Field(ge=-90.0, le=90.0)
+    lng: float = Field(ge=-180.0, le=180.0)
+    accuracy: Optional[int] = Field(None, ge=0, le=1500)
+
+
+class SendLocationReq(LatLng):
+    chat: str | int
+    reply_to: Optional[int] = None
+
+
+class SendLiveLocationReq(LatLng):
+    chat: str | int
+    period: int
+    heading: Optional[int] = Field(None, ge=1, le=360)
+    proximity: Optional[int] = Field(None, ge=0, le=100000)
+    reply_to: Optional[int] = None
+
+    @field_validator("period")
+    @classmethod
+    def _period_valid(cls, v: int) -> int:
+        if v == LIVE_PERIOD_INDEFINITE:
+            return v
+        if not (LIVE_PERIOD_MIN <= v <= LIVE_PERIOD_MAX):
+            raise ValueError(
+                f"period must be in [{LIVE_PERIOD_MIN}, {LIVE_PERIOD_MAX}] "
+                f"seconds, or {LIVE_PERIOD_INDEFINITE} (0x7FFFFFFF) for "
+                f"indefinite sharing"
+            )
+        return v
+
+
+class EditLiveLocationReq(LatLng):
+    chat: str | int
+    msg_id: int = Field(ge=1)
+    heading: Optional[int] = Field(None, ge=1, le=360)
+    proximity: Optional[int] = Field(None, ge=0, le=100000)
+
+
+class StopLiveLocationReq(BaseModel):
+    chat: str | int
+    msg_id: int = Field(ge=1)
+
+
+@app.post("/location/send")
+async def location_send(req: SendLocationReq) -> dict[str, Any]:
+    msg_id = await _sess().send_location(
+        req.chat, req.lat, req.lng, accuracy=req.accuracy, reply_to=req.reply_to
+    )
+    audit.log("location_send", chat=str(req.chat), msg_id=msg_id)
+    return {"ok": True, "msg_id": msg_id}
+
+
+@app.post("/location/send_live")
+async def location_send_live(req: SendLiveLocationReq) -> dict[str, Any]:
+    msg_id = await _sess().send_live_location(
+        req.chat,
+        req.lat,
+        req.lng,
+        req.period,
+        accuracy=req.accuracy,
+        heading=req.heading,
+        proximity=req.proximity,
+        reply_to=req.reply_to,
+    )
+    audit.log(
+        "location_send_live",
+        chat=str(req.chat),
+        msg_id=msg_id,
+        period=req.period,
+    )
+    return {"ok": True, "msg_id": msg_id}
+
+
+@app.post("/location/edit_live")
+async def location_edit_live(req: EditLiveLocationReq) -> dict[str, Any]:
+    await _sess().edit_live_location(
+        req.chat,
+        req.msg_id,
+        req.lat,
+        req.lng,
+        accuracy=req.accuracy,
+        heading=req.heading,
+        proximity=req.proximity,
+    )
+    audit.log("location_edit_live", chat=str(req.chat), msg_id=req.msg_id)
+    return {"ok": True}
+
+
+@app.post("/location/stop_live")
+async def location_stop_live(req: StopLiveLocationReq) -> dict[str, Any]:
+    await _sess().stop_live_location(req.chat, req.msg_id)
+    audit.log("location_stop_live", chat=str(req.chat), msg_id=req.msg_id)
+    return {"ok": True}
+
+
 # ---------- stories ----------
 
 

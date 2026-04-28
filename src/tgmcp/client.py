@@ -548,6 +548,83 @@ class DaemonClient:
             },
         )
 
+    # ----- Geo / live location -----
+
+    def location_send(
+        self,
+        chat: str | int,
+        lat: float,
+        lng: float,
+        *,
+        accuracy: int | None = None,
+        reply_to: int | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/location/send",
+            {
+                "chat": chat,
+                "lat": lat,
+                "lng": lng,
+                "accuracy": accuracy,
+                "reply_to": reply_to,
+            },
+        )
+
+    def location_send_live(
+        self,
+        chat: str | int,
+        lat: float,
+        lng: float,
+        period: int,
+        *,
+        accuracy: int | None = None,
+        heading: int | None = None,
+        proximity: int | None = None,
+        reply_to: int | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/location/send_live",
+            {
+                "chat": chat,
+                "lat": lat,
+                "lng": lng,
+                "period": period,
+                "accuracy": accuracy,
+                "heading": heading,
+                "proximity": proximity,
+                "reply_to": reply_to,
+            },
+        )
+
+    def location_edit_live(
+        self,
+        chat: str | int,
+        msg_id: int,
+        lat: float,
+        lng: float,
+        *,
+        accuracy: int | None = None,
+        heading: int | None = None,
+        proximity: int | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/location/edit_live",
+            {
+                "chat": chat,
+                "msg_id": msg_id,
+                "lat": lat,
+                "lng": lng,
+                "accuracy": accuracy,
+                "heading": heading,
+                "proximity": proximity,
+            },
+        )
+
+    def location_stop_live(self, chat: str | int, msg_id: int) -> dict[str, Any]:
+        return self._post(
+            "/location/stop_live", {"chat": chat, "msg_id": msg_id}
+        )
+
     # ----- Stories -----
 
     def stories_active(self, peer: str | int) -> dict[str, Any]:

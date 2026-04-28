@@ -1861,6 +1861,119 @@ class TGSession:
             return m[0].id if m else 0
         return m.id
 
+    # ----- Geo / location -----
+
+    async def send_location(
+        self,
+        chat: str | int,
+        lat: float,
+        lng: float,
+        *,
+        accuracy: Optional[int] = None,
+        reply_to: Optional[int] = None,
+    ) -> int:
+        """Send a static (one-shot) location pin. Returns the new msg id."""
+        from telethon.tl.types import InputGeoPoint, InputMediaGeoPoint
+
+        media = InputMediaGeoPoint(
+            geo_point=InputGeoPoint(lat=lat, long=lng, accuracy_radius=accuracy)
+        )
+        entity = await self.client.get_entity(chat)
+        m = await self.client.send_file(entity, media, reply_to=reply_to)
+        return m.id
+
+    async def send_live_location(
+        self,
+        chat: str | int,
+        lat: float,
+        lng: float,
+        period: int,
+        *,
+        accuracy: Optional[int] = None,
+        heading: Optional[int] = None,
+        proximity: Optional[int] = None,
+        reply_to: Optional[int] = None,
+    ) -> int:
+        """Send a live (continuously-updated) location.
+
+        `period` is duration in seconds (Telegram supports specific
+        values: 60, 900 (15min), 3600 (1h), 28800 (8h), or 0xFFFFFFFF
+        which means "indefinite, until stopped"). The schema layer
+        constrains to those slots; we let upstream raise if anything
+        slips through.
+        """
+        from telethon.tl.types import InputGeoPoint, InputMediaGeoLive
+
+        media = InputMediaGeoLive(
+            geo_point=InputGeoPoint(lat=lat, long=lng, accuracy_radius=accuracy),
+            period=period,
+            heading=heading,
+            proximity_notification_radius=proximity,
+        )
+        entity = await self.client.get_entity(chat)
+        m = await self.client.send_file(entity, media, reply_to=reply_to)
+        return m.id
+
+    async def edit_live_location(
+        self,
+        chat: str | int,
+        msg_id: int,
+        lat: float,
+        lng: float,
+        *,
+        accuracy: Optional[int] = None,
+        heading: Optional[int] = None,
+        proximity: Optional[int] = None,
+    ) -> bool:
+        """Update the coordinates of a previously-sent live location."""
+        from telethon.tl.functions.messages import EditMessageRequest
+        from telethon.tl.types import InputGeoPoint, InputMediaGeoLive
+
+        entity = await self.client.get_entity(chat)
+        media = InputMediaGeoLive(
+            geo_point=InputGeoPoint(lat=lat, long=lng, accuracy_radius=accuracy),
+            heading=heading,
+            proximity_notification_radius=proximity,
+        )
+        await self.client(
+            EditMessageRequest(peer=entity, id=msg_id, media=media)
+        )
+        return True
+
+    async def stop_live_location(self, chat: str | int, msg_id: int) -> bool:
+        """Stop sharing a live location.
+
+        MTProto's edit-message RPC requires a `geo_point` even on the
+        stop call. We fetch the current message and reuse its
+        last-known coordinates so clients don't briefly re-anchor the
+        marker to (0,0) before showing 'sharing stopped'.
+        """
+        from telethon.tl.functions.messages import EditMessageRequest
+        from telethon.tl.types import InputGeoPoint, InputMediaGeoLive
+
+        entity = await self.client.get_entity(chat)
+        existing = await self.client.get_messages(entity, ids=msg_id)
+        if not existing or not getattr(existing, "media", None):
+            raise ValueError(
+                f"message {msg_id} in {chat} has no media to stop"
+            )
+        geo = getattr(existing.media, "geo", None)
+        if geo is None:
+            raise ValueError(
+                f"message {msg_id} is not a live-location message "
+                "(no geo on media)"
+            )
+        last_lat = float(getattr(geo, "lat", 0.0) or 0.0)
+        last_lng = float(getattr(geo, "long", 0.0) or 0.0)
+        media = InputMediaGeoLive(
+            geo_point=InputGeoPoint(lat=last_lat, long=last_lng),
+            stopped=True,
+        )
+        await self.client(
+            EditMessageRequest(peer=entity, id=msg_id, media=media)
+        )
+        return True
+
     # ----- Stories -----
 
     @staticmethod
