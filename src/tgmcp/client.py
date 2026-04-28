@@ -208,6 +208,49 @@ class DaemonClient:
     def contact_search(self, query: str, limit: int = 20) -> dict[str, Any]:
         return self._post("/contacts/search", {"query": query, "limit": limit})
 
+    # ----- channel admin -----
+
+    def chat_participants(
+        self,
+        chat: str | int,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        search: str = "",
+        filter_kind: str = "all",
+    ) -> dict[str, Any]:
+        return self._post(
+            "/chat/participants",
+            {
+                "chat": chat,
+                "limit": limit,
+                "offset": offset,
+                "search": search,
+                "filter_kind": filter_kind,
+            },
+        )
+
+    def chat_signatures(self, chat: str | int, enabled: bool) -> dict[str, Any]:
+        return self._post("/chat/signatures", {"chat": chat, "enabled": enabled})
+
+    def chat_slow_mode(self, chat: str | int, seconds: int) -> dict[str, Any]:
+        return self._post("/chat/slow_mode", {"chat": chat, "seconds": seconds})
+
+    def chat_discussion(
+        self, broadcast: str | int, group: str | int | None
+    ) -> dict[str, Any]:
+        return self._post(
+            "/chat/discussion", {"broadcast": broadcast, "group": group}
+        )
+
+    def chat_admin_log(
+        self, chat: str | int, *, limit: int = 50, search: str = ""
+    ) -> dict[str, Any]:
+        return self._post(
+            "/chat/admin_log",
+            {"chat": chat, "limit": limit, "search": search},
+        )
+
     # ----- privacy -----
 
     def privacy_get(self, key: str) -> dict[str, Any]:

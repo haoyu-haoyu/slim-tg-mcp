@@ -1,12 +1,17 @@
 ---
 name: tg-group-admin
 description: |
-  Create groups/channels, add/kick/ban/unban members, generate invite
-  links, rename a chat, leave a chat. Triggers (EN): "create group",
-  "make a channel", "add to group", "kick from", "ban", "unban", "invite
-  link", "rename group", "leave group". Triggers (中文): "建群", "建
-  频道", "拉人", "踢人", "封禁", "解封", "邀请链接", "改群名", "退群".
-  Use ONLY for group/channel admin write actions.
+  Group / channel admin: create groups & channels, add/kick/ban/unban
+  members, generate invite links, rename, leave, list participants
+  (paginated, with filter), toggle channel signatures, set megagroup
+  slow mode, bind/unbind a discussion group, read the admin
+  recent-events log. Triggers (EN): "create group", "make a channel",
+  "add to group", "kick", "ban", "unban", "invite link", "rename",
+  "leave group", "list members", "show participants", "channel
+  signatures", "slow mode", "discussion group", "admin log".
+  Triggers (中文): "建群", "建频道", "拉人", "踢人", "封禁", "解封",
+  "邀请链接", "改群名", "退群", "看成员", "列群成员", "频道签名",
+  "慢速模式", "讨论组", "管理员日志".
 ---
 
 # Telegram: Group / channel admin
@@ -40,6 +45,17 @@ python ${CLAUDE_SKILL_DIR}/admin.py invite --chat "@x" \
 
 python ${CLAUDE_SKILL_DIR}/admin.py rename --chat "@x" --title "New name"
 python ${CLAUDE_SKILL_DIR}/admin.py leave  --chat "@x"
+
+# Read members (paginated; --filter ∈ all/admins/kicked/banned/bots/search)
+python ${CLAUDE_SKILL_DIR}/admin.py participants \
+  --chat "@x" [--limit 100] [--offset 0] [--filter all] [--search "name"]
+
+# Channel/megagroup advanced controls
+python ${CLAUDE_SKILL_DIR}/admin.py signatures --chat "@x" --on    # broadcast channels
+python ${CLAUDE_SKILL_DIR}/admin.py slow-mode  --chat "@x" --seconds 60   # megagroups
+python ${CLAUDE_SKILL_DIR}/admin.py discussion --broadcast "@channel" --group "@discussion_group"
+python ${CLAUDE_SKILL_DIR}/admin.py discussion --broadcast "@channel" --unbind
+python ${CLAUDE_SKILL_DIR}/admin.py admin-log  --chat "@x" [--limit 50] [--search "kick"]
 ```
 
 Notes:

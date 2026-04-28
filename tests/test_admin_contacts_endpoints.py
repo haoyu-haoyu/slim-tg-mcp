@@ -109,7 +109,12 @@ def _load_skill(name: str, file: str):
 
 def test_group_admin_skill_dispatcher_has_all_subcommands():
     mod = _load_skill("tg-group-admin", "admin.py")
-    expected = {"create", "add", "kick", "ban", "unban", "invite", "rename", "leave"}
+    # The original 8 (Phase 2) plus the Phase 3 additions for channel
+    # admin and member listing.
+    expected = {
+        "create", "add", "kick", "ban", "unban", "invite", "rename", "leave",
+        "participants", "signatures", "slow-mode", "discussion", "admin-log",
+    }
     assert set(mod.HANDLERS.keys()) == expected
     parser = mod.build_parser()
     for sub in expected:

@@ -689,6 +689,158 @@ class TGSession:
         await self.client(UnblockRequest(id=user_entity))
         return True
 
+    # ----- Channel admin (Phase 3) -----
+
+    async def get_participants(
+        self,
+        chat: str | int,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        search: str = "",
+        filter_kind: str = "all",
+    ) -> dict[str, Any]:
+        """Paginated list of group/channel members.
+
+        `filter_kind` ∈ {"all", "admins", "kicked", "banned", "bots",
+        "search"}. Telegram's API requires admins-of-channels permission
+        to enumerate members of large channels; smaller groups are
+        accessible to any member.
+        """
+        from telethon.tl.types import (
+            ChannelParticipantsAdmins,
+            ChannelParticipantsBanned,
+            ChannelParticipantsBots,
+            ChannelParticipantsKicked,
+            ChannelParticipantsSearch,
+        )
+
+        filter_obj = None
+        if filter_kind == "admins":
+            filter_obj = ChannelParticipantsAdmins()
+        elif filter_kind == "kicked":
+            filter_obj = ChannelParticipantsKicked(q="")
+        elif filter_kind == "banned":
+            filter_obj = ChannelParticipantsBanned(q="")
+        elif filter_kind == "bots":
+            filter_obj = ChannelParticipantsBots()
+        elif filter_kind == "search":
+            filter_obj = ChannelParticipantsSearch(q=search)
+        elif filter_kind != "all":
+            raise ValueError(
+                f"unknown filter_kind {filter_kind!r}; valid: all/admins/kicked/banned/bots/search"
+            )
+
+        from telethon.tl.types import (
+            ChannelParticipantAdmin,
+            ChannelParticipantCreator,
+            ChatParticipantAdmin,
+            ChatParticipantCreator,
+        )
+
+        admin_types = (
+            ChannelParticipantAdmin,
+            ChannelParticipantCreator,
+            ChatParticipantAdmin,
+            ChatParticipantCreator,
+        )
+
+        entity = await self.client.get_entity(chat)
+        users = []
+        async for u in self.client.iter_participants(
+            entity, limit=limit, offset=offset, filter=filter_obj, search=search or None
+        ):
+            participant = getattr(u, "participant", None)
+            users.append(
+                {
+                    "id": u.id,
+                    "username": getattr(u, "username", None),
+                    "first_name": getattr(u, "first_name", None),
+                    "last_name": getattr(u, "last_name", None),
+                    "is_bot": getattr(u, "bot", False),
+                    # `isinstance` covers both Channel* (megagroups/channels)
+                    # and Chat* (classic basic groups) admin/creator types.
+                    # The previous string-name check missed Chat* and silently
+                    # mis-reported every admin in a basic group as non-admin.
+                    "is_admin": isinstance(participant, admin_types),
+                }
+            )
+        return {"users": users, "total_returned": len(users)}
+
+    async def channel_set_signatures(self, chat: str | int, enabled: bool) -> bool:
+        """Toggle "Sign messages with author name" on a broadcast channel.
+
+        Telethon's `ToggleSignaturesRequest` keyword is `signatures_enabled`
+        (NOT `enabled` — passing the wrong name `TypeError`s before any
+        RPC).
+        """
+        from telethon.tl.functions.channels import ToggleSignaturesRequest
+
+        entity = await self.client.get_entity(chat)
+        await self.client(
+            ToggleSignaturesRequest(channel=entity, signatures_enabled=enabled)
+        )
+        return True
+
+    async def channel_set_slow_mode(self, chat: str | int, seconds: int) -> bool:
+        """Set per-user slow mode on a megagroup. 0 disables, valid
+        non-zero values are 10, 30, 60, 300, 900, 3600."""
+        from telethon.tl.functions.channels import ToggleSlowModeRequest
+
+        ALLOWED = {0, 10, 30, 60, 300, 900, 3600}
+        if seconds not in ALLOWED:
+            raise ValueError(
+                f"slow_mode seconds must be one of {sorted(ALLOWED)}; got {seconds}"
+            )
+        entity = await self.client.get_entity(chat)
+        await self.client(ToggleSlowModeRequest(channel=entity, seconds=seconds))
+        return True
+
+    async def channel_set_discussion(
+        self,
+        broadcast: str | int,
+        group: Optional[str | int],
+    ) -> bool:
+        """Bind a discussion megagroup to a broadcast channel, or unbind
+        when `group` is None."""
+        from telethon.tl.functions.channels import SetDiscussionGroupRequest
+        from telethon.tl.types import InputChannelEmpty
+
+        bcast = await self.client.get_input_entity(broadcast)
+        grp = (
+            await self.client.get_input_entity(group)
+            if group is not None
+            else InputChannelEmpty()
+        )
+        await self.client(SetDiscussionGroupRequest(broadcast=bcast, group=grp))
+        return True
+
+    async def channel_admin_log(
+        self,
+        chat: str | int,
+        *,
+        limit: int = 50,
+        search: str = "",
+    ) -> list[dict[str, Any]]:
+        """Read the channel/megagroup admin recent-events log. The user
+        must be an admin of the chat or this raises CHAT_ADMIN_REQUIRED."""
+        entity = await self.client.get_entity(chat)
+        out = []
+        async for ev in self.client.iter_admin_log(
+            entity, limit=limit, search=search or None
+        ):
+            out.append(
+                {
+                    "id": ev.id,
+                    "date": ev.date.astimezone(timezone.utc).isoformat()
+                    if ev.date
+                    else None,
+                    "user_id": ev.user_id,
+                    "action_kind": type(ev.action).__name__ if ev.action else None,
+                }
+            )
+        return out
+
     # ----- Privacy settings -----
 
     @staticmethod

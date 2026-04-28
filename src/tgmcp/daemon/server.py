@@ -419,6 +419,52 @@ VOICE_EXTS = {".ogg", ".oga", ".opus", ".mp3", ".m4a"}
 _USERNAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{3,30}[a-zA-Z0-9]$")
 
 
+class GetParticipantsReq(BaseModel):
+    chat: str | int
+    limit: int = Field(100, ge=1, le=1000)
+    offset: int = Field(0, ge=0)
+    search: str = Field("", max_length=200)
+    filter_kind: str = "all"
+
+    @field_validator("filter_kind")
+    @classmethod
+    def _valid_filter(cls, v: str) -> str:
+        valid = {"all", "admins", "kicked", "banned", "bots", "search"}
+        if v not in valid:
+            raise ValueError(f"filter_kind must be one of {sorted(valid)}; got {v!r}")
+        return v
+
+
+class SignaturesReq(BaseModel):
+    chat: str | int
+    enabled: bool
+
+
+class SlowModeReq(BaseModel):
+    chat: str | int
+    # 0 disables; non-zero must be one of Telegram's allowed slot values.
+    seconds: int = Field(...)
+
+    @field_validator("seconds")
+    @classmethod
+    def _valid_seconds(cls, v: int) -> int:
+        allowed = {0, 10, 30, 60, 300, 900, 3600}
+        if v not in allowed:
+            raise ValueError(f"seconds must be one of {sorted(allowed)}; got {v}")
+        return v
+
+
+class DiscussionReq(BaseModel):
+    broadcast: str | int
+    group: Optional[str | int] = None  # None = unbind
+
+
+class AdminLogReq(BaseModel):
+    chat: str | int
+    limit: int = Field(50, ge=1, le=500)
+    search: str = Field("", max_length=200)
+
+
 _PRIVACY_KEYS = {
     "status",
     "photo",
@@ -1411,6 +1457,53 @@ async def export_chat(req: ExportChatReq) -> dict[str, Any]:
         include_media=req.include_media,
     )
     return res
+
+
+# ---------- Channels (Phase 3) ----------
+
+
+@app.post("/chat/participants")
+async def chat_participants(req: GetParticipantsReq) -> dict[str, Any]:
+    return await _sess().get_participants(
+        req.chat,
+        limit=req.limit,
+        offset=req.offset,
+        search=req.search,
+        filter_kind=req.filter_kind,
+    )
+
+
+@app.post("/chat/signatures")
+async def chat_signatures(req: SignaturesReq) -> dict[str, Any]:
+    await _sess().channel_set_signatures(req.chat, req.enabled)
+    audit.log("chat_signatures", chat=str(req.chat), enabled=req.enabled)
+    return {"ok": True}
+
+
+@app.post("/chat/slow_mode")
+async def chat_slow_mode(req: SlowModeReq) -> dict[str, Any]:
+    await _sess().channel_set_slow_mode(req.chat, req.seconds)
+    audit.log("chat_slow_mode", chat=str(req.chat), seconds=req.seconds)
+    return {"ok": True}
+
+
+@app.post("/chat/discussion")
+async def chat_discussion(req: DiscussionReq) -> dict[str, Any]:
+    await _sess().channel_set_discussion(req.broadcast, req.group)
+    audit.log(
+        "chat_discussion",
+        broadcast=str(req.broadcast),
+        group=str(req.group) if req.group is not None else "(unbind)",
+    )
+    return {"ok": True}
+
+
+@app.post("/chat/admin_log")
+async def chat_admin_log(req: AdminLogReq) -> dict[str, Any]:
+    events = await _sess().channel_admin_log(
+        req.chat, limit=req.limit, search=req.search
+    )
+    return {"events": events}
 
 
 # ---------- Privacy ----------

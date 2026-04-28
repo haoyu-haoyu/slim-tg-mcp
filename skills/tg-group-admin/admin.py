@@ -74,6 +74,43 @@ def cmd_leave(args, c):
     return c.chat_leave(_coerce(args.chat))
 
 
+def cmd_participants(args, c):
+    return c.chat_participants(
+        _coerce(args.chat),
+        limit=args.limit,
+        offset=args.offset,
+        search=args.search or "",
+        filter_kind=args.filter,
+    )
+
+
+def cmd_signatures(args, c):
+    if args.on and args.off:
+        raise SystemExit("error: --on and --off are mutually exclusive")
+    if not (args.on or args.off):
+        raise SystemExit("error: pass --on or --off")
+    return c.chat_signatures(_coerce(args.chat), enabled=args.on)
+
+
+def cmd_slow_mode(args, c):
+    return c.chat_slow_mode(_coerce(args.chat), args.seconds)
+
+
+def cmd_discussion(args, c):
+    if args.unbind and args.group:
+        raise SystemExit("error: --group and --unbind are mutually exclusive")
+    return c.chat_discussion(
+        _coerce(args.broadcast),
+        None if args.unbind else _coerce(args.group),
+    )
+
+
+def cmd_admin_log(args, c):
+    return c.chat_admin_log(
+        _coerce(args.chat), limit=args.limit, search=args.search or ""
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="admin.py")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -102,6 +139,43 @@ def build_parser() -> argparse.ArgumentParser:
     lv = sub.add_parser("leave")
     lv.add_argument("--chat", required=True)
 
+    pp = sub.add_parser("participants")
+    pp.add_argument("--chat", required=True)
+    pp.add_argument("--limit", type=int, default=100)
+    pp.add_argument("--offset", type=int, default=0)
+    pp.add_argument("--search", default=None)
+    pp.add_argument(
+        "--filter",
+        default="all",
+        choices=["all", "admins", "kicked", "banned", "bots", "search"],
+    )
+
+    sig = sub.add_parser("signatures")
+    sig.add_argument("--chat", required=True)
+    g = sig.add_mutually_exclusive_group()
+    g.add_argument("--on", action="store_true")
+    g.add_argument("--off", action="store_true")
+
+    sm = sub.add_parser("slow-mode")
+    sm.add_argument("--chat", required=True)
+    sm.add_argument(
+        "--seconds",
+        type=int,
+        required=True,
+        help="0 disables; non-zero ∈ {10,30,60,300,900,3600}",
+    )
+
+    ds = sub.add_parser("discussion")
+    ds.add_argument("--broadcast", required=True)
+    grp = ds.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--group", default=None)
+    grp.add_argument("--unbind", action="store_true")
+
+    al = sub.add_parser("admin-log")
+    al.add_argument("--chat", required=True)
+    al.add_argument("--limit", type=int, default=50)
+    al.add_argument("--search", default=None)
+
     return p
 
 
@@ -114,6 +188,11 @@ HANDLERS = {
     "invite": cmd_invite,
     "rename": cmd_rename,
     "leave": cmd_leave,
+    "participants": cmd_participants,
+    "signatures": cmd_signatures,
+    "slow-mode": cmd_slow_mode,
+    "discussion": cmd_discussion,
+    "admin-log": cmd_admin_log,
 }
 
 
