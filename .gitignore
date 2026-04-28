@@ -5,6 +5,8 @@
 sessions/
 .tgmcp/
 config.toml
+.env
+.env.*
 
 # Python
 __pycache__/

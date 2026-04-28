@@ -46,6 +46,34 @@ SRC = PROJECT_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+
+def _load_env_file() -> None:
+    """If `.env.e2e` exists at the repo root, load KEY=VALUE pairs from it
+    into os.environ (without overriding values already set).
+
+    Lets you run `python scripts/e2e_smoke.py` from an IDE / Jupyter /
+    anywhere without exporting env vars in a shell first. Lines starting
+    with `#` are comments. The file MUST be gitignored (we ship a
+    .gitignore line for `.env*` so this is safe by default).
+    """
+    env_path = PROJECT_ROOT / ".env.e2e"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+
+
+_load_env_file()
+
 from tgmcp.client import DaemonClient  # noqa: E402
 from tgmcp.daemon import auth  # noqa: E402
 
@@ -317,13 +345,9 @@ def run_bot() -> None:
 
 
 def main() -> int:
-    if os.environ.get("TGMCP_E2E_CONFIRM") != "yes":
-        fail(
-            "This script touches a real Telegram account.\n"
-            "  Set TGMCP_E2E_CONFIRM=yes to acknowledge, then re-run.\n"
-            "  Recommended: use a burner account, not your main one."
-        )
-
+    # Parse args FIRST so `--help` / `-h` still works without requiring
+    # the user to set TGMCP_E2E_CONFIRM. argparse exits cleanly on --help
+    # before we reach the confirm gate below.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core", action="store_true", help="v0.1+v0.2 core flow")
     parser.add_argument("--privacy", action="store_true", help="read 10 privacy keys")
@@ -347,6 +371,14 @@ def main() -> int:
     )
     parser.add_argument("--all", action="store_true", help="enable every group above")
     args = parser.parse_args()
+
+    # Confirm gate now (after --help has had a chance to short-circuit).
+    if os.environ.get("TGMCP_E2E_CONFIRM") != "yes":
+        fail(
+            "This script touches a real Telegram account.\n"
+            "  Set TGMCP_E2E_CONFIRM=yes to acknowledge, then re-run.\n"
+            "  Recommended: use a burner account, not your main one."
+        )
 
     # Default: read-only + self-only safe set
     if not any(
