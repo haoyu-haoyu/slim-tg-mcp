@@ -208,6 +208,46 @@ class DaemonClient:
     def contact_search(self, query: str, limit: int = 20) -> dict[str, Any]:
         return self._post("/contacts/search", {"query": query, "limit": limit})
 
+    # ----- scheduling + drafts -----
+
+    def scheduled_send(
+        self,
+        chat: str | int,
+        text: str,
+        schedule_date: str,  # ISO-8601 timezone-aware
+        reply_to: int | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/scheduled/send",
+            {
+                "chat": chat,
+                "text": text,
+                "schedule_date": schedule_date,
+                "reply_to": reply_to,
+            },
+        )
+
+    def scheduled_list(self, chat: str | int, limit: int = 100) -> dict[str, Any]:
+        return self._post("/scheduled/list", {"chat": chat, "limit": limit})
+
+    def scheduled_delete(self, chat: str | int, msg_ids: list[int]) -> dict[str, Any]:
+        return self._post(
+            "/scheduled/delete", {"chat": chat, "msg_ids": msg_ids}
+        )
+
+    def draft_save(
+        self, chat: str | int, text: str, reply_to: int | None = None
+    ) -> dict[str, Any]:
+        return self._post(
+            "/draft/save", {"chat": chat, "text": text, "reply_to": reply_to}
+        )
+
+    def draft_get(self, chat: str | int) -> dict[str, Any]:
+        return self._post("/draft/get", {"chat": chat})
+
+    def draft_clear(self, chat: str | int) -> dict[str, Any]:
+        return self._post("/draft/clear", {"chat": chat})
+
     # ----- polls -----
 
     def poll_create(

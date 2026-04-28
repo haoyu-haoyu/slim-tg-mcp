@@ -689,6 +689,110 @@ class TGSession:
         await self.client(UnblockRequest(id=user_entity))
         return True
 
+    # ----- Scheduled messages + Drafts -----
+
+    async def send_scheduled(
+        self,
+        chat: str | int,
+        text: str,
+        schedule_date: datetime,
+        *,
+        reply_to: Optional[int] = None,
+    ) -> int:
+        """Schedule `text` for delivery at `schedule_date` (must be UTC-aware).
+
+        Telegram requires the schedule to be at least a few seconds in the
+        future and at most ~365 days out. We let Telethon raise the
+        upstream error for boundary cases; the daemon's schema layer
+        catches obviously-bad inputs (past timestamps).
+        """
+        entity = await self.client.get_entity(chat)
+        m = await self.client.send_message(
+            entity, text, schedule=schedule_date, reply_to=reply_to
+        )
+        return m.id
+
+    async def list_scheduled(
+        self, chat: str | int, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        entity = await self.client.get_entity(chat)
+        out: list[dict[str, Any]] = []
+        async for m in self.client.iter_messages(entity, limit=limit, scheduled=True):
+            out.append(
+                {
+                    "id": m.id,
+                    "scheduled_for": m.date.astimezone(timezone.utc).isoformat() if m.date else None,
+                    "text": m.message or "",
+                    "has_media": m.media is not None,
+                    "reply_to_msg_id": m.reply_to_msg_id,
+                }
+            )
+        return out
+
+    async def delete_scheduled(self, chat: str | int, msg_ids: list[int]) -> int:
+        """Cancel scheduled messages. Telethon's `scheduled=True` routes via
+        the messages.deleteScheduledMessages RPC, which is the right kind
+        of delete for the scheduled queue (regular delete_messages would
+        not see them)."""
+        entity = await self.client.get_entity(chat)
+        await self.client.delete_messages(entity, msg_ids, scheduled=True)
+        return len(msg_ids)
+
+    async def save_draft(
+        self,
+        chat: str | int,
+        text: str,
+        *,
+        reply_to: Optional[int] = None,
+    ) -> bool:
+        from telethon.tl.functions.messages import SaveDraftRequest
+
+        entity = await self.client.get_entity(chat)
+        await self.client(
+            SaveDraftRequest(peer=entity, message=text, reply_to_msg_id=reply_to)
+        )
+        return True
+
+    async def get_draft(self, chat: str | int) -> Optional[dict[str, Any]]:
+        """Return the saved draft for `chat`, or None if none is set.
+
+        `iter_drafts()` returns placeholder DraftMessage objects for chats
+        the user has merely opened — empty `text` AND no `reply_to_msg_id`
+        means there's no real draft. Treating those as "None" matches the
+        official client's UX (an empty draft isn't shown in the chat list).
+        """
+        entity = await self.client.get_entity(chat)
+        target_peer_id = await self.client.get_peer_id(entity)
+        async for draft in self.client.iter_drafts():
+            try:
+                draft_peer_id = await self.client.get_peer_id(draft.entity)
+            except Exception:
+                continue
+            if draft_peer_id != target_peer_id:
+                continue
+
+            text = draft.text or ""
+            reply_to = getattr(draft, "reply_to_msg_id", None)
+            if not text and not reply_to:
+                # Placeholder for an opened-but-empty chat — not a real draft.
+                return None
+            return {
+                "text": text,
+                "date": draft.date.astimezone(timezone.utc).isoformat()
+                if draft.date
+                else None,
+                "reply_to_msg_id": reply_to,
+            }
+        return None
+
+    async def clear_draft(self, chat: str | int) -> bool:
+        """Clearing is just SaveDraft with an empty message."""
+        from telethon.tl.functions.messages import SaveDraftRequest
+
+        entity = await self.client.get_entity(chat)
+        await self.client(SaveDraftRequest(peer=entity, message=""))
+        return True
+
     # ----- Polls -----
 
     async def create_poll(

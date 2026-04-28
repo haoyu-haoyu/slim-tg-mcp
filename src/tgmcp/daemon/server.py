@@ -397,6 +397,55 @@ MAX_CAPTION_CHARS = 1024
 VOICE_EXTS = {".ogg", ".oga", ".opus", ".mp3", ".m4a"}
 
 
+class SendScheduledReq(BaseModel):
+    chat: str | int
+    text: str = Field(..., min_length=1, max_length=4096)
+    schedule_date: datetime
+    reply_to: Optional[int] = None
+
+    @field_validator("schedule_date")
+    @classmethod
+    def _must_be_future_and_within_year(cls, v: datetime) -> datetime:
+        from datetime import timezone as _tz
+
+        if v.tzinfo is None:
+            raise ValueError("schedule_date must be timezone-aware (UTC recommended)")
+        now = datetime.now(_tz.utc)
+        delta = (v - now).total_seconds()
+        if delta < 10:
+            raise ValueError(
+                f"schedule_date must be at least 10 seconds in the future "
+                f"(got {delta:.1f}s)"
+            )
+        if delta > 365 * 24 * 3600:
+            raise ValueError("schedule_date must be within 365 days from now")
+        return v
+
+
+class ListScheduledReq(BaseModel):
+    chat: str | int
+    limit: int = Field(100, ge=1, le=500)
+
+
+class DeleteScheduledReq(BaseModel):
+    chat: str | int
+    msg_ids: list[int] = Field(..., min_length=1, max_length=100)
+
+
+class SaveDraftReq(BaseModel):
+    chat: str | int
+    # Empty drafts must go through /draft/clear so the API has one obvious
+    # path for each intent. Otherwise empty-save's behavior depends on
+    # Telegram's interpretation and can leave a blank draft visible in the
+    # client.
+    text: str = Field(..., min_length=1, max_length=4096)
+    reply_to: Optional[int] = None
+
+
+class GetDraftReq(BaseModel):
+    chat: str | int
+
+
 class CreatePollReq(BaseModel):
     chat: str | int
     question: str = Field(..., min_length=1, max_length=300)
@@ -1001,6 +1050,77 @@ def _audit_path_redacted(abs_path: str) -> dict[str, Any]:
         os.path.dirname(abs_path).encode("utf-8")
     ).hexdigest()[:8]
     return {"name": os.path.basename(abs_path), "parent_hash": parent_hash}
+
+
+@app.post("/scheduled/send")
+async def scheduled_send(req: SendScheduledReq) -> dict[str, Any]:
+    # Re-check the schedule window right before issuing the send. Pydantic
+    # validates at parse time; any in-process delay (queueing, slow auth,
+    # etc.) could push a borderline request below the 10s minimum, in
+    # which case Telethon would surface an upstream 502. Bouncing here
+    # gives callers a deterministic 400 instead.
+    from datetime import timezone as _tz
+    delta = (req.schedule_date - datetime.now(_tz.utc)).total_seconds()
+    if delta < 10:
+        raise HTTPException(
+            400,
+            f"schedule_date is now only {delta:.1f}s in the future; "
+            "must be ≥10s. Re-issue with a fresh timestamp.",
+        )
+
+    msg_id = await _sess().send_scheduled(
+        req.chat, req.text, req.schedule_date, reply_to=req.reply_to
+    )
+    audit.log(
+        "scheduled_send",
+        chat=str(req.chat),
+        msg_id=msg_id,
+        # Log timestamp + length, not body — same content-redaction stance
+        # as polls. The audit confirms WHEN something was queued, not WHAT.
+        scheduled_for=req.schedule_date.isoformat(),
+        text_len=len(req.text),
+    )
+    return {"ok": True, "msg_id": msg_id}
+
+
+@app.post("/scheduled/list")
+async def scheduled_list(req: ListScheduledReq) -> dict[str, Any]:
+    items = await _sess().list_scheduled(req.chat, limit=req.limit)
+    return {"scheduled": items}
+
+
+@app.post("/scheduled/delete")
+async def scheduled_delete(req: DeleteScheduledReq) -> dict[str, Any]:
+    requested = await _sess().delete_scheduled(req.chat, req.msg_ids)
+    audit.log(
+        "scheduled_delete",
+        chat=str(req.chat),
+        msg_ids=req.msg_ids,
+        requested=requested,
+    )
+    return {"ok": True, "requested": requested}
+
+
+@app.post("/draft/save")
+async def draft_save(req: SaveDraftReq) -> dict[str, Any]:
+    await _sess().save_draft(req.chat, req.text, reply_to=req.reply_to)
+    # Drafts are private to the user but still recorded as a write. Don't
+    # leak the body — only metadata.
+    audit.log("draft_save", chat=str(req.chat), text_len=len(req.text))
+    return {"ok": True}
+
+
+@app.post("/draft/get")
+async def draft_get(req: GetDraftReq) -> dict[str, Any]:
+    draft = await _sess().get_draft(req.chat)
+    return {"draft": draft}
+
+
+@app.post("/draft/clear")
+async def draft_clear(req: GetDraftReq) -> dict[str, Any]:
+    await _sess().clear_draft(req.chat)
+    audit.log("draft_clear", chat=str(req.chat))
+    return {"ok": True}
 
 
 @app.post("/poll/create")
