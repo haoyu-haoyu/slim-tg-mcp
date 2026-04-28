@@ -25,10 +25,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Optional
 
+import re
+
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import audit, auth
 from .telegram import TGConfig, TGSession
@@ -310,6 +312,70 @@ class SwitchAccountReq(BaseModel):
     passphrase: Optional[str] = None  # only required for --passphrase accounts
 
 
+# ----- Group/Channel admin -----
+
+
+class CreateGroupReq(BaseModel):
+    title: str
+    users: list[str | int] = []
+    megagroup: bool = False
+    broadcast: bool = False
+    about: str = ""
+
+
+class ChatMemberReq(BaseModel):
+    chat: str | int
+    user: str | int
+
+
+class InviteLinkReq(BaseModel):
+    chat: str | int
+    expire_seconds: Optional[int] = None
+    usage_limit: Optional[int] = None
+
+
+class SetTitleReq(BaseModel):
+    chat: str | int
+    title: str
+
+
+class LeaveReq(BaseModel):
+    chat: str | int
+
+
+# ----- Contacts -----
+
+
+_E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+
+
+class AddContactReq(BaseModel):
+    phone: str
+    first_name: str
+    last_name: str = ""
+
+    @field_validator("phone")
+    @classmethod
+    def _validate_e164(cls, v: str) -> str:
+        """Enforce E.164 at the HTTP boundary so direct daemon/client
+        callers can't bypass the skill's input check. Telegram itself
+        requires + and country code for ImportContactsRequest."""
+        if not _E164_RE.fullmatch(v):
+            raise ValueError(
+                f"phone must be E.164 format (start with + and country code): {v!r}"
+            )
+        return v
+
+
+class ContactUserReq(BaseModel):
+    user: str | int
+
+
+class SearchContactsReq(BaseModel):
+    query: str
+    limit: int = Field(20, ge=1, le=100)
+
+
 # ---------- routes ----------
 
 
@@ -549,6 +615,128 @@ async def mark_read(req: MarkReadReq) -> dict[str, Any]:
     await _sess().mark_as_read(req.chat)
     audit.log("mark_read", chat=str(req.chat))
     return {"ok": True}
+
+
+# ---------- Group/Channel admin ----------
+
+
+@app.post("/chat/create")
+async def chat_create(req: CreateGroupReq) -> dict[str, Any]:
+    info = await _sess().create_group(
+        req.title,
+        req.users,
+        megagroup=req.megagroup,
+        broadcast=req.broadcast,
+        about=req.about,
+    )
+    audit.log(
+        "chat_create",
+        title=req.title,
+        kind=info.get("kind"),
+        chat_id=info.get("id"),
+        member_count=len(req.users),
+    )
+    return info
+
+
+@app.post("/chat/add_member")
+async def chat_add_member(req: ChatMemberReq) -> dict[str, Any]:
+    await _sess().add_chat_member(req.chat, req.user)
+    audit.log("chat_add_member", chat=str(req.chat), user=str(req.user))
+    return {"ok": True}
+
+
+@app.post("/chat/kick_member")
+async def chat_kick_member(req: ChatMemberReq) -> dict[str, Any]:
+    await _sess().kick_chat_member(req.chat, req.user)
+    audit.log("chat_kick_member", chat=str(req.chat), user=str(req.user))
+    return {"ok": True}
+
+
+@app.post("/chat/ban_member")
+async def chat_ban_member(req: ChatMemberReq) -> dict[str, Any]:
+    await _sess().ban_chat_member(req.chat, req.user)
+    audit.log("chat_ban_member", chat=str(req.chat), user=str(req.user))
+    return {"ok": True}
+
+
+@app.post("/chat/unban_member")
+async def chat_unban_member(req: ChatMemberReq) -> dict[str, Any]:
+    await _sess().unban_chat_member(req.chat, req.user)
+    audit.log("chat_unban_member", chat=str(req.chat), user=str(req.user))
+    return {"ok": True}
+
+
+@app.post("/chat/invite_link")
+async def chat_invite_link(req: InviteLinkReq) -> dict[str, Any]:
+    link = await _sess().create_invite_link(
+        req.chat,
+        expire_seconds=req.expire_seconds,
+        usage_limit=req.usage_limit,
+    )
+    audit.log(
+        "chat_invite_link",
+        chat=str(req.chat),
+        expire_seconds=req.expire_seconds,
+        usage_limit=req.usage_limit,
+    )
+    return {"link": link}
+
+
+@app.post("/chat/set_title")
+async def chat_set_title(req: SetTitleReq) -> dict[str, Any]:
+    await _sess().set_chat_title(req.chat, req.title)
+    audit.log("chat_set_title", chat=str(req.chat), title=req.title)
+    return {"ok": True}
+
+
+@app.post("/chat/leave")
+async def chat_leave(req: LeaveReq) -> dict[str, Any]:
+    await _sess().leave_chat(req.chat)
+    audit.log("chat_leave", chat=str(req.chat))
+    return {"ok": True}
+
+
+# ---------- Contacts ----------
+
+
+@app.post("/contacts/add")
+async def contacts_add(req: AddContactReq) -> dict[str, Any]:
+    info = await _sess().add_contact(req.phone, req.first_name, req.last_name)
+    audit.log(
+        "contact_add",
+        phone_suffix=req.phone[-4:] if len(req.phone) >= 4 else "",
+        imported=info.get("imported"),
+        user_id=info.get("id"),
+    )
+    return info
+
+
+@app.post("/contacts/delete")
+async def contacts_delete(req: ContactUserReq) -> dict[str, Any]:
+    await _sess().delete_contact(req.user)
+    audit.log("contact_delete", user=str(req.user))
+    return {"ok": True}
+
+
+@app.post("/contacts/block")
+async def contacts_block(req: ContactUserReq) -> dict[str, Any]:
+    await _sess().block_user(req.user)
+    audit.log("contact_block", user=str(req.user))
+    return {"ok": True}
+
+
+@app.post("/contacts/unblock")
+async def contacts_unblock(req: ContactUserReq) -> dict[str, Any]:
+    await _sess().unblock_user(req.user)
+    audit.log("contact_unblock", user=str(req.user))
+    return {"ok": True}
+
+
+@app.post("/contacts/search")
+async def contacts_search(req: SearchContactsReq) -> dict[str, Any]:
+    users = await _sess().search_contacts(req.query, limit=req.limit)
+    return {"users": users}
 
 
 # ---------- entry point ----------

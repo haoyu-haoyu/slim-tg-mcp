@@ -126,3 +126,84 @@ class DaemonClient:
             "/accounts/switch",
             {"label": label, "passphrase": passphrase},
         )
+
+    # ----- group admin -----
+
+    def chat_create(
+        self,
+        title: str,
+        users: list[str | int] | None = None,
+        *,
+        megagroup: bool = False,
+        broadcast: bool = False,
+        about: str = "",
+    ) -> dict[str, Any]:
+        return self._post(
+            "/chat/create",
+            {
+                "title": title,
+                "users": users or [],
+                "megagroup": megagroup,
+                "broadcast": broadcast,
+                "about": about,
+            },
+        )
+
+    def chat_add_member(self, chat: str | int, user: str | int) -> dict[str, Any]:
+        return self._post("/chat/add_member", {"chat": chat, "user": user})
+
+    def chat_kick_member(self, chat: str | int, user: str | int) -> dict[str, Any]:
+        return self._post("/chat/kick_member", {"chat": chat, "user": user})
+
+    def chat_ban_member(self, chat: str | int, user: str | int) -> dict[str, Any]:
+        return self._post("/chat/ban_member", {"chat": chat, "user": user})
+
+    def chat_unban_member(self, chat: str | int, user: str | int) -> dict[str, Any]:
+        return self._post("/chat/unban_member", {"chat": chat, "user": user})
+
+    def chat_invite_link(
+        self,
+        chat: str | int,
+        *,
+        expire_seconds: int | None = None,
+        usage_limit: int | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/chat/invite_link",
+            {
+                "chat": chat,
+                "expire_seconds": expire_seconds,
+                "usage_limit": usage_limit,
+            },
+        )
+
+    def chat_set_title(self, chat: str | int, title: str) -> dict[str, Any]:
+        return self._post("/chat/set_title", {"chat": chat, "title": title})
+
+    def chat_leave(self, chat: str | int) -> dict[str, Any]:
+        return self._post("/chat/leave", {"chat": chat})
+
+    # ----- contacts -----
+
+    def contact_add(
+        self,
+        phone: str,
+        first_name: str,
+        last_name: str = "",
+    ) -> dict[str, Any]:
+        return self._post(
+            "/contacts/add",
+            {"phone": phone, "first_name": first_name, "last_name": last_name},
+        )
+
+    def contact_delete(self, user: str | int) -> dict[str, Any]:
+        return self._post("/contacts/delete", {"user": user})
+
+    def contact_block(self, user: str | int) -> dict[str, Any]:
+        return self._post("/contacts/block", {"user": user})
+
+    def contact_unblock(self, user: str | int) -> dict[str, Any]:
+        return self._post("/contacts/unblock", {"user": user})
+
+    def contact_search(self, query: str, limit: int = 20) -> dict[str, Any]:
+        return self._post("/contacts/search", {"query": query, "limit": limit})

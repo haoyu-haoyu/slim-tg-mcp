@@ -441,6 +441,284 @@ class TGSession:
         await self.client.send_read_acknowledge(entity)
         return True
 
+    # ----- Group/Channel admin -----
+
+    async def create_group(
+        self,
+        title: str,
+        users: list[str | int],
+        *,
+        megagroup: bool = False,
+        broadcast: bool = False,
+        about: str = "",
+    ) -> dict[str, Any]:
+        """Create a new chat. Three flavours:
+          - Default: classic basic group (capped at 200 members).
+          - megagroup=True: supergroup (unlimited members, message history).
+          - broadcast=True: broadcast channel (one-way posting).
+
+        Returns {id, kind, title}. The new chat is reachable via the
+        returned `id` (Telethon-marked format).
+        """
+        if broadcast and megagroup:
+            raise ValueError("megagroup and broadcast are mutually exclusive")
+
+        entities = []
+        unresolved: list[str | int] = []
+        for u in users:
+            try:
+                entities.append(await self.client.get_entity(u))
+            except Exception:
+                unresolved.append(u)
+
+        if not (megagroup or broadcast) and not entities:
+            # Basic groups (`messages.createChat`) require invitees on
+            # creation — Telegram returns UsersTooFewError otherwise. Fail
+            # early with a useful message instead of leaking that RPC error.
+            raise ValueError(
+                "basic group creation requires at least one resolvable invitee; "
+                f"unresolved: {unresolved!r}. Use --megagroup if you want to "
+                "create an empty supergroup and add members later."
+            )
+
+        if megagroup or broadcast:
+            from telethon.tl.functions.channels import CreateChannelRequest
+
+            result = await self.client(
+                CreateChannelRequest(
+                    title=title,
+                    about=about,
+                    megagroup=megagroup,
+                    broadcast=broadcast,
+                )
+            )
+            new_chat = result.chats[0]
+            if entities and megagroup:
+                from telethon.tl.functions.channels import InviteToChannelRequest
+
+                try:
+                    await self.client(
+                        InviteToChannelRequest(channel=new_chat, users=entities)
+                    )
+                except Exception:
+                    pass  # creation succeeded; partial invite is acceptable
+            kind = "channel" if broadcast else "group"
+        else:
+            from telethon.tl.functions.messages import CreateChatRequest
+
+            result = await self.client(CreateChatRequest(users=entities, title=title))
+            # Basic group result has .updates.chats
+            updates = result.updates if hasattr(result, "updates") else result
+            new_chat = updates.chats[0]
+            kind = "group"
+
+        return {
+            "id": await self.client.get_peer_id(new_chat),
+            "raw_id": new_chat.id,
+            "kind": kind,
+            "title": getattr(new_chat, "title", title),
+        }
+
+    async def add_chat_member(self, chat: str | int, user: str | int) -> bool:
+        from telethon.tl.functions.channels import InviteToChannelRequest
+        from telethon.tl.functions.messages import AddChatUserRequest
+        from telethon.tl.types import Channel
+
+        chat_entity = await self.client.get_entity(chat)
+        user_entity = await self.client.get_entity(user)
+        if isinstance(chat_entity, Channel):
+            await self.client(
+                InviteToChannelRequest(channel=chat_entity, users=[user_entity])
+            )
+        else:
+            await self.client(
+                AddChatUserRequest(
+                    chat_id=chat_entity.id, user_id=user_entity, fwd_limit=50
+                )
+            )
+        return True
+
+    async def kick_chat_member(self, chat: str | int, user: str | int) -> bool:
+        """Kick a member. They CAN rejoin (unlike ban)."""
+        chat_entity = await self.client.get_entity(chat)
+        user_entity = await self.client.get_entity(user)
+        await self.client.kick_participant(chat_entity, user_entity)
+        return True
+
+    async def ban_chat_member(self, chat: str | int, user: str | int) -> bool:
+        """Ban a member from a channel/supergroup. They cannot rejoin."""
+        from telethon.tl.functions.channels import EditBannedRequest
+        from telethon.tl.types import ChatBannedRights
+
+        chat_entity = await self.client.get_entity(chat)
+        user_entity = await self.client.get_entity(user)
+        rights = ChatBannedRights(
+            until_date=None,
+            view_messages=True,
+            send_messages=True,
+            send_media=True,
+            send_stickers=True,
+            send_gifs=True,
+            send_games=True,
+            send_inline=True,
+            embed_links=True,
+        )
+        await self.client(
+            EditBannedRequest(channel=chat_entity, participant=user_entity, banned_rights=rights)
+        )
+        return True
+
+    async def unban_chat_member(self, chat: str | int, user: str | int) -> bool:
+        from telethon.tl.functions.channels import EditBannedRequest
+        from telethon.tl.types import ChatBannedRights
+
+        chat_entity = await self.client.get_entity(chat)
+        user_entity = await self.client.get_entity(user)
+        # All-False rights = restore default permissions (no ban).
+        rights = ChatBannedRights(until_date=None)
+        await self.client(
+            EditBannedRequest(channel=chat_entity, participant=user_entity, banned_rights=rights)
+        )
+        return True
+
+    async def create_invite_link(
+        self,
+        chat: str | int,
+        *,
+        expire_seconds: Optional[int] = None,
+        usage_limit: Optional[int] = None,
+    ) -> str:
+        from telethon.tl.functions.messages import ExportChatInviteRequest
+
+        chat_entity = await self.client.get_entity(chat)
+        kwargs: dict[str, Any] = {"peer": chat_entity}
+        if expire_seconds is not None:
+            from datetime import datetime, timedelta, timezone
+
+            kwargs["expire_date"] = datetime.now(timezone.utc) + timedelta(
+                seconds=expire_seconds
+            )
+        if usage_limit is not None:
+            kwargs["usage_limit"] = usage_limit
+        result = await self.client(ExportChatInviteRequest(**kwargs))
+        return result.link
+
+    async def set_chat_title(self, chat: str | int, title: str) -> bool:
+        from telethon.tl.functions.channels import EditTitleRequest as ChEditTitle
+        from telethon.tl.functions.messages import EditChatTitleRequest as MsgEditTitle
+        from telethon.tl.types import Channel
+
+        chat_entity = await self.client.get_entity(chat)
+        if isinstance(chat_entity, Channel):
+            await self.client(ChEditTitle(channel=chat_entity, title=title))
+        else:
+            await self.client(MsgEditTitle(chat_id=chat_entity.id, title=title))
+        return True
+
+    async def leave_chat(self, chat: str | int) -> bool:
+        from telethon.tl.functions.channels import LeaveChannelRequest
+        from telethon.tl.functions.messages import DeleteChatUserRequest
+        from telethon.tl.types import Channel
+
+        chat_entity = await self.client.get_entity(chat)
+        if isinstance(chat_entity, Channel):
+            await self.client(LeaveChannelRequest(channel=chat_entity))
+        else:
+            me = await self.client.get_me()
+            await self.client(
+                DeleteChatUserRequest(chat_id=chat_entity.id, user_id=me)
+            )
+        return True
+
+    # ----- Contacts -----
+
+    async def add_contact(
+        self,
+        phone: str,
+        first_name: str,
+        last_name: str = "",
+        *,
+        add_phone_privacy_exception: bool = False,
+    ) -> dict[str, Any]:
+        """Add a phone contact. Phone must include country code (e.g. +14155552671)."""
+        from telethon.tl.functions.contacts import ImportContactsRequest
+        from telethon.tl.types import InputPhoneContact
+
+        result = await self.client(
+            ImportContactsRequest(
+                contacts=[
+                    InputPhoneContact(
+                        client_id=0,
+                        phone=phone,
+                        first_name=first_name,
+                        last_name=last_name,
+                    )
+                ]
+            )
+        )
+        await self._refresh_contacts()
+        if not result.users:
+            return {"imported": False, "phone": phone}
+        u = result.users[0]
+        return {
+            "imported": True,
+            "id": u.id,
+            "username": getattr(u, "username", None),
+            "phone": getattr(u, "phone", None),
+        }
+
+    async def delete_contact(self, user: str | int) -> bool:
+        from telethon.tl.functions.contacts import DeleteContactsRequest
+
+        user_entity = await self.client.get_entity(user)
+        await self.client(DeleteContactsRequest(id=[user_entity]))
+        await self._refresh_contacts()
+        return True
+
+    async def block_user(self, user: str | int) -> bool:
+        from telethon.tl.functions.contacts import BlockRequest
+
+        user_entity = await self.client.get_entity(user)
+        await self.client(BlockRequest(id=user_entity))
+        return True
+
+    async def unblock_user(self, user: str | int) -> bool:
+        from telethon.tl.functions.contacts import UnblockRequest
+
+        user_entity = await self.client.get_entity(user)
+        await self.client(UnblockRequest(id=user_entity))
+        return True
+
+    async def search_contacts(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Search the user's saved contacts.
+
+        Telegram's `contacts.search` returns BOTH the user's contacts AND
+        global username matches, including bots. Under an endpoint named
+        "contacts/search" it would be misleading (and a privacy footgun
+        for a prompt-injected agent) to leak strangers and bots. We filter
+        the result down to the user's actual contacts; for global search,
+        the existing `tg_resolve_entity` MCP tool is the right path.
+        """
+        from telethon.tl.functions.contacts import SearchRequest
+
+        result = await self.client(SearchRequest(q=query, limit=limit))
+        out = []
+        for u in result.users:
+            if getattr(u, "bot", False):
+                continue
+            if u.id not in self.contact_ids:
+                continue
+            out.append(
+                {
+                    "id": u.id,
+                    "username": getattr(u, "username", None),
+                    "first_name": getattr(u, "first_name", None),
+                    "last_name": getattr(u, "last_name", None),
+                    "is_contact": True,
+                }
+            )
+        return out
+
 
 @asynccontextmanager
 async def session_lifespan(cfg: TGConfig) -> AsyncIterator[TGSession]:
