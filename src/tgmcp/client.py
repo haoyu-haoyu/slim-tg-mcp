@@ -208,6 +208,50 @@ class DaemonClient:
     def contact_search(self, query: str, limit: int = 20) -> dict[str, Any]:
         return self._post("/contacts/search", {"query": query, "limit": limit})
 
+    # ----- privacy -----
+
+    def privacy_get(self, key: str) -> dict[str, Any]:
+        return self._post("/privacy/get", {"key": key})
+
+    def privacy_set(self, key: str, rules: list[dict]) -> dict[str, Any]:
+        return self._post("/privacy/set", {"key": key, "rules": rules})
+
+    # ----- folders -----
+
+    def folders_list(self) -> dict[str, Any]:
+        return self._get("/folders/list")
+
+    def folders_update(
+        self,
+        folder_id: int,
+        *,
+        title: str,
+        include_peers: list[str | int] | None = None,
+        exclude_peers: list[str | int] | None = None,
+        contacts: bool = False,
+        non_contacts: bool = False,
+        groups: bool = False,
+        broadcasts: bool = False,
+        bots: bool = False,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/folders/update",
+            {
+                "folder_id": folder_id,
+                "title": title,
+                "include_peers": include_peers or [],
+                "exclude_peers": exclude_peers or [],
+                "contacts": contacts,
+                "non_contacts": non_contacts,
+                "groups": groups,
+                "broadcasts": broadcasts,
+                "bots": bots,
+            },
+        )
+
+    def folders_delete(self, folder_id: int) -> dict[str, Any]:
+        return self._post("/folders/delete", {"folder_id": folder_id})
+
     # ----- export -----
 
     def export_chat(

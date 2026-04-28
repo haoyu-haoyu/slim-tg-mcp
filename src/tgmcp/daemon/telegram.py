@@ -689,6 +689,181 @@ class TGSession:
         await self.client(UnblockRequest(id=user_entity))
         return True
 
+    # ----- Privacy settings -----
+
+    @staticmethod
+    def _privacy_key(name: str):
+        from telethon.tl.types import (
+            InputPrivacyKeyAbout,
+            InputPrivacyKeyAddedByPhone,
+            InputPrivacyKeyChatInvite,
+            InputPrivacyKeyForwards,
+            InputPrivacyKeyPhoneCall,
+            InputPrivacyKeyPhoneNumber,
+            InputPrivacyKeyPhoneP2P,
+            InputPrivacyKeyProfilePhoto,
+            InputPrivacyKeyStatusTimestamp,
+            InputPrivacyKeyVoiceMessages,
+        )
+
+        mapping = {
+            "status": InputPrivacyKeyStatusTimestamp,
+            "photo": InputPrivacyKeyProfilePhoto,
+            "calls": InputPrivacyKeyPhoneCall,
+            "forwards": InputPrivacyKeyForwards,
+            "chat_invite": InputPrivacyKeyChatInvite,
+            "phone": InputPrivacyKeyPhoneNumber,
+            "added_by_phone": InputPrivacyKeyAddedByPhone,
+            "voice": InputPrivacyKeyVoiceMessages,
+            "about": InputPrivacyKeyAbout,
+            "p2p": InputPrivacyKeyPhoneP2P,
+        }
+        if name not in mapping:
+            raise ValueError(
+                f"unknown privacy key {name!r}; valid: {sorted(mapping.keys())}"
+            )
+        return mapping[name]()
+
+    async def _resolve_privacy_rules(self, rules: list[dict]) -> list:
+        """Convert friendly rule dicts into Telethon InputPrivacyRule* objects.
+
+        Each rule is `{"kind": "...", "user_ids": [...optional...]}`.
+        Order matters: rules are evaluated top-down by Telegram.
+        """
+        from telethon.tl.types import (
+            InputPrivacyValueAllowAll,
+            InputPrivacyValueAllowContacts,
+            InputPrivacyValueAllowUsers,
+            InputPrivacyValueDisallowAll,
+            InputPrivacyValueDisallowContacts,
+            InputPrivacyValueDisallowUsers,
+        )
+
+        out = []
+        for r in rules:
+            kind = r.get("kind")
+            if kind == "allow_all":
+                out.append(InputPrivacyValueAllowAll())
+            elif kind == "disallow_all":
+                out.append(InputPrivacyValueDisallowAll())
+            elif kind == "allow_contacts":
+                out.append(InputPrivacyValueAllowContacts())
+            elif kind == "disallow_contacts":
+                out.append(InputPrivacyValueDisallowContacts())
+            elif kind in ("allow_users", "disallow_users"):
+                user_ids = r.get("user_ids") or []
+                input_users = []
+                for uid in user_ids:
+                    e = await self.client.get_input_entity(uid)
+                    input_users.append(e)
+                if kind == "allow_users":
+                    out.append(InputPrivacyValueAllowUsers(users=input_users))
+                else:
+                    out.append(InputPrivacyValueDisallowUsers(users=input_users))
+            else:
+                raise ValueError(f"unknown rule kind {kind!r}")
+        return out
+
+    async def get_privacy(self, key: str) -> dict[str, Any]:
+        from telethon.tl.functions.account import GetPrivacyRequest
+
+        result = await self.client(GetPrivacyRequest(key=self._privacy_key(key)))
+        rules = []
+        for r in result.rules:
+            cls_name = type(r).__name__
+            rules.append(
+                {
+                    "kind": cls_name,
+                    "user_ids": [u.user_id for u in getattr(r, "users", []) or []],
+                }
+            )
+        return {"key": key, "rules": rules}
+
+    async def set_privacy(self, key: str, rules: list[dict]) -> dict[str, Any]:
+        from telethon.tl.functions.account import SetPrivacyRequest
+
+        input_rules = await self._resolve_privacy_rules(rules)
+        await self.client(
+            SetPrivacyRequest(key=self._privacy_key(key), rules=input_rules)
+        )
+        return await self.get_privacy(key)
+
+    # ----- Folders (dialog filters) -----
+
+    async def list_folders(self) -> list[dict[str, Any]]:
+        from telethon.tl.functions.messages import GetDialogFiltersRequest
+
+        result = await self.client(GetDialogFiltersRequest())
+        # Telethon ≥1.36 returns DialogFilters wrapper; older returns list.
+        filters = getattr(result, "filters", result)
+        out = []
+        for f in filters:
+            if hasattr(f, "id") and getattr(f, "title", None) is not None:
+                out.append(
+                    {
+                        "id": f.id,
+                        "title": f.title,
+                        "include_count": len(getattr(f, "include_peers", []) or []),
+                        "exclude_count": len(getattr(f, "exclude_peers", []) or []),
+                        "pinned_count": len(getattr(f, "pinned_peers", []) or []),
+                        "contacts": getattr(f, "contacts", False),
+                        "non_contacts": getattr(f, "non_contacts", False),
+                        "groups": getattr(f, "groups", False),
+                        "broadcasts": getattr(f, "broadcasts", False),
+                        "bots": getattr(f, "bots", False),
+                    }
+                )
+        return out
+
+    async def update_folder(
+        self,
+        folder_id: int,
+        *,
+        title: str,
+        include_peers: Optional[list[str | int]] = None,
+        exclude_peers: Optional[list[str | int]] = None,
+        contacts: bool = False,
+        non_contacts: bool = False,
+        groups: bool = False,
+        broadcasts: bool = False,
+        bots: bool = False,
+    ) -> dict[str, Any]:
+        """Create or update a folder (dialog filter). Same RPC for both —
+        a new id creates; an existing id replaces."""
+        from telethon.tl.functions.messages import UpdateDialogFilterRequest
+        from telethon.tl.types import DialogFilter
+
+        async def _resolve(items):
+            return [
+                await self.client.get_input_entity(p)
+                for p in (items or [])
+            ]
+
+        f = DialogFilter(
+            id=folder_id,
+            title=title,
+            pinned_peers=[],
+            include_peers=await _resolve(include_peers),
+            exclude_peers=await _resolve(exclude_peers),
+            contacts=contacts,
+            non_contacts=non_contacts,
+            groups=groups,
+            broadcasts=broadcasts,
+            bots=bots,
+            exclude_muted=False,
+            exclude_read=False,
+            exclude_archived=False,
+        )
+        await self.client(UpdateDialogFilterRequest(id=folder_id, filter=f))
+        return {"id": folder_id, "title": title}
+
+    async def delete_folder(self, folder_id: int) -> bool:
+        from telethon.tl.functions.messages import UpdateDialogFilterRequest
+
+        # Passing filter=None tells Telegram to delete the filter id.
+        await self.client(UpdateDialogFilterRequest(id=folder_id, filter=None))
+        return True
+
     # ----- Chat export -----
 
     async def export_chat(

@@ -29,8 +29,9 @@ import re
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import audit, auth
 from .telegram import TGConfig, TGSession
@@ -176,6 +177,20 @@ app = FastAPI(title="slim-tg-mcp daemon", lifespan=lifespan)
 
 def _err(status: int, kind: str, detail: str) -> JSONResponse:
     return JSONResponse(status_code=status, content={"error": kind, "detail": detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def _handle_validation(_req: Request, exc: RequestValidationError) -> JSONResponse:
+    """Map FastAPI's default 422 body-validation errors to a uniform 400.
+
+    All client-facing schema errors in this daemon are 400 ("client sent
+    bad input"). FastAPI's default 422 is a fine HTTP semantic, but it
+    splits the error surface — pydantic field rejections become 422 while
+    custom HTTPException(400) calls inside handlers stay 400. Coercing
+    here means callers (the CLI, the skill dispatchers, anything else
+    using DaemonClient) can branch on a single status code.
+    """
+    return _err(400, "ValidationError", str(exc.errors()))
 
 
 @app.exception_handler(ValueError)
@@ -402,6 +417,127 @@ VOICE_EXTS = {".ogg", ".oga", ".opus", ".mp3", ".m4a"}
 #   1 letter prefix + 3..30 mid chars (alnum or `_`) + 1 alnum suffix
 # = 5..32 chars total.
 _USERNAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{3,30}[a-zA-Z0-9]$")
+
+
+_PRIVACY_KEYS = {
+    "status",
+    "photo",
+    "calls",
+    "forwards",
+    "chat_invite",
+    "phone",
+    "added_by_phone",
+    "voice",
+    "about",
+    "p2p",
+}
+_PRIVACY_RULE_KINDS = {
+    "allow_all",
+    "disallow_all",
+    "allow_contacts",
+    "disallow_contacts",
+    "allow_users",
+    "disallow_users",
+}
+
+
+class PrivacyRule(BaseModel):
+    kind: str
+    user_ids: list[int] = []
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, v: str) -> str:
+        if v not in _PRIVACY_RULE_KINDS:
+            raise ValueError(
+                f"unknown rule kind {v!r}; valid: {sorted(_PRIVACY_RULE_KINDS)}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _user_ids_match_kind(self) -> "PrivacyRule":
+        """`allow_users` / `disallow_users` need a non-empty list. Every
+        other kind must NOT carry user_ids — silently dropping them
+        would surprise callers."""
+        needs_users = self.kind in ("allow_users", "disallow_users")
+        if needs_users and not self.user_ids:
+            raise ValueError(
+                f"rule kind {self.kind!r} requires a non-empty user_ids list"
+            )
+        if not needs_users and self.user_ids:
+            raise ValueError(
+                f"rule kind {self.kind!r} does not accept user_ids; got {self.user_ids!r}"
+            )
+        return self
+
+
+class GetPrivacyReq(BaseModel):
+    key: str
+
+    @field_validator("key")
+    @classmethod
+    def _validate_key(cls, v: str) -> str:
+        if v not in _PRIVACY_KEYS:
+            raise ValueError(
+                f"unknown privacy key {v!r}; valid: {sorted(_PRIVACY_KEYS)}"
+            )
+        return v
+
+
+class SetPrivacyReq(BaseModel):
+    key: str
+    rules: list[PrivacyRule] = Field(..., min_length=1, max_length=10)
+
+    @field_validator("key")
+    @classmethod
+    def _validate_key(cls, v: str) -> str:
+        if v not in _PRIVACY_KEYS:
+            raise ValueError(
+                f"unknown privacy key {v!r}; valid: {sorted(_PRIVACY_KEYS)}"
+            )
+        return v
+
+
+class FolderPeerSpec(BaseModel):
+    """Caller-friendly folder spec — peer references are username/id strings.
+
+    `title` cap is 12 (UTF-8 chars) per Telegram's dialogFilter.title
+    limit. Anything wider would have been MESSAGE_TOO_LONG-ed upstream.
+    """
+
+    folder_id: int = Field(..., ge=2, le=255)  # Telegram reserves 0/1 for special
+    title: str = Field(..., min_length=1, max_length=12)
+    include_peers: list[str | int] = []
+    exclude_peers: list[str | int] = []
+    contacts: bool = False
+    non_contacts: bool = False
+    groups: bool = False
+    broadcasts: bool = False
+    bots: bool = False
+
+    @model_validator(mode="after")
+    def _at_least_one_inclusion(self) -> "FolderPeerSpec":
+        """messages.updateDialogFilter rejects FILTER_INCLUDE_EMPTY — an
+        empty folder definition with no peers and no kind-of-chats flag
+        is meaningless. Bounce here so the caller gets a deterministic
+        400, not an upstream Telegram error."""
+        if not (
+            self.include_peers
+            or self.contacts
+            or self.non_contacts
+            or self.groups
+            or self.broadcasts
+            or self.bots
+        ):
+            raise ValueError(
+                "folder needs at least one inclusion: pass include_peers, "
+                "or set one of contacts/non_contacts/groups/broadcasts/bots"
+            )
+        return self
+
+
+class FolderIdReq(BaseModel):
+    folder_id: int = Field(..., ge=2, le=255)
 
 
 class ExportChatReq(BaseModel):
@@ -1275,6 +1411,66 @@ async def export_chat(req: ExportChatReq) -> dict[str, Any]:
         include_media=req.include_media,
     )
     return res
+
+
+# ---------- Privacy ----------
+
+
+@app.post("/privacy/get")
+async def privacy_get(req: GetPrivacyReq) -> dict[str, Any]:
+    return await _sess().get_privacy(req.key)
+
+
+@app.post("/privacy/set")
+async def privacy_set(req: SetPrivacyReq) -> dict[str, Any]:
+    rules_raw = [r.model_dump() for r in req.rules]
+    res = await _sess().set_privacy(req.key, rules_raw)
+    audit.log(
+        "privacy_set",
+        key=req.key,
+        rule_count=len(req.rules),
+        # Audit records what KEY changed and how many rules — not the raw
+        # user-id allowlists, which can be sensitive (who you've blocked).
+    )
+    return res
+
+
+# ---------- Folders ----------
+
+
+@app.get("/folders/list")
+async def folders_list() -> dict[str, Any]:
+    return {"folders": await _sess().list_folders()}
+
+
+@app.post("/folders/update")
+async def folders_update(req: FolderPeerSpec) -> dict[str, Any]:
+    res = await _sess().update_folder(
+        req.folder_id,
+        title=req.title,
+        include_peers=req.include_peers,
+        exclude_peers=req.exclude_peers,
+        contacts=req.contacts,
+        non_contacts=req.non_contacts,
+        groups=req.groups,
+        broadcasts=req.broadcasts,
+        bots=req.bots,
+    )
+    audit.log(
+        "folder_update",
+        folder_id=req.folder_id,
+        title_len=len(req.title),
+        include_count=len(req.include_peers),
+        exclude_count=len(req.exclude_peers),
+    )
+    return res
+
+
+@app.post("/folders/delete")
+async def folders_delete(req: FolderIdReq) -> dict[str, Any]:
+    await _sess().delete_folder(req.folder_id)
+    audit.log("folder_delete", folder_id=req.folder_id)
+    return {"ok": True}
 
 
 @app.post("/profile/update")
