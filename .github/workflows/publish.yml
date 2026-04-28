@@ -1,0 +1,142 @@
+name: Publish to PyPI
+
+# Fires on every pushed tag like `v0.5.0`, `v0.6.0`, etc.
+# To cut a release:
+#   git tag -a v0.6.0 -m "v0.6.0"
+#   git push origin v0.6.0
+#
+# Trusted Publishing (OIDC) — no API token stored anywhere. PyPI verifies
+# this workflow is the real one via GitHub's OIDC provider, then issues a
+# short-lived (~15 min) token scoped only to the slim-tg-mcp project.
+#
+# REQUIRED ONE-TIME SETUP (on https://pypi.org):
+#   1. https://pypi.org/manage/project/slim-tg-mcp/settings/publishing/
+#   2. Under "Add a new trusted publisher", choose "GitHub"
+#      (For a brand-new project that doesn't exist on PyPI yet, use
+#      "Add a pending publisher" at
+#      https://pypi.org/manage/account/publishing/ instead.)
+#   3. Fill in:
+#        owner:         haoyu-haoyu
+#        repository:    slim-tg-mcp
+#        workflow:      publish.yml
+#        environment:   pypi   (must match the `environment:` field below)
+#   4. Save. From then on, every git tag push triggers a tokenless release.
+#
+# See docs/release.md for the full play-by-play.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Block concurrent publish runs — re-running for the same tag would double-
+# upload, and PyPI rejects duplicates with a hard error that masks any real
+# issue. One publish per tag, period.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Re-run the test matrix BEFORE publishing. A green tag must mean
+  # "this exact commit passed tests on every supported Python." Splitting
+  # this from CI's normal-push run is intentional — tag pushes don't
+  # trigger that workflow because it filters on branches.
+  test:
+    name: Pre-release tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Lint (ruff)
+        run: ruff check src/ tests/
+      - name: Test
+        run: pytest tests/ -v --tb=short
+
+  build:
+    name: Build sdist + wheel
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build twine
+
+      - name: Verify tag matches pyproject.toml version
+        # Only meaningful on actual tag pushes. On workflow_dispatch /
+        # branch pushes there's no tag, so we'd compare an empty string
+        # against the pyproject version and always fail. Skip in that
+        # case so the build job is still useful as a "does the package
+        # build cleanly?" smoke test.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          # Defense against accidental "wrong tag" releases:
+          # tag must be exactly v<version-in-pyproject>.
+          tag="${GITHUB_REF#refs/tags/}"
+          ver=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$tag" != "v$ver" ]; then
+            echo "::error::tag '$tag' does not match pyproject version 'v$ver'"
+            exit 1
+          fi
+
+      - name: Build
+        run: python -m build
+
+      - name: Validate metadata
+        run: twine check dist/*
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pypi-dist
+          path: dist/
+          retention-days: 7
+
+  publish:
+    name: Publish to PyPI (OIDC)
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish on actual tag pushes. workflow_dispatch / branch
+    # pushes still run the test + build jobs (useful for verifying the
+    # workflow itself), but skip the upload step. The tag/version check
+    # in `build` is a second line of defense, not the primary one.
+    if: startsWith(github.ref, 'refs/tags/v')
+    # `environment:` is REQUIRED for the OIDC binding. The name here must
+    # exactly match what you registered on PyPI (see header comment).
+    environment:
+      name: pypi
+      url: https://pypi.org/project/slim-tg-mcp/
+    permissions:
+      id-token: write  # OIDC — this is what makes Trusted Publishing work
+      contents: read
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: pypi-dist
+          path: dist/
+
+      - name: Publish via PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No `password:` parameter — pypa/gh-action-pypi-publish reads the
+        # OIDC id-token automatically when run in this environment. PyPI
+        # exchanges it for a short-lived API token bound to this project.
