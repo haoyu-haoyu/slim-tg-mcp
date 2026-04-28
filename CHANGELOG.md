@@ -2,6 +2,86 @@
 
 All notable changes to this project follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-04-28
+
+Phase 4: closed remaining gaps with chigwell/telegram-mcp by adding
+**bot mode**, **forum topics**, **stories**, **live location**,
+**premium reactions + emoji status**, plus operational pieces
+(Prometheus metrics, architecture doc).
+
+### Added — four new skills (Phase 4)
+
+- **tg-bot** — Bot-mode operations on a separate auth path. New
+  `tgmcp init --bot-token <token>` flow (token via stdin or env;
+  argv warned). Auth envelope's AAD now binds `(label, kind)` so
+  flipping kind in a stolen envelope breaks decryption. TGSession
+  cross-checks `me.bot` against envelope kind on start. Skills:
+  `send` (inline keyboards, callback / url buttons with strict
+  scheme + size validation), `poll` (drains in-memory CallbackQuery
+  queue, deque maxlen=200 dropping oldest), `answer`, `commands`.
+  Skill refuses if active account isn't a bot.
+
+- **tg-topics** — Forum supergroup topics: list / create / edit /
+  delete / pin. Telethon 1.43 puts these RPCs in `messages.*` (not
+  `channels.*`); CreateForumTopicRequest needs a random_id (we use
+  `secrets.randbits(63)`); list filters out `ForumTopicDeleted`
+  variants. Delete requires `--yes` (irreversible).
+
+- **tg-stories** — Read peer's active and pinned stories, mark-read
+  (`--ack` required — viewed receipt is observable, lurk-safe
+  default), delete own (peer hardcoded to "me"). Send is
+  intentionally NOT exposed; story creation needs media + privacy
+  rules + period and deserves its own batch.
+
+- **tg-location** — Static pin (`send`), live share with period in
+  `[60, 86400] s` or 0x7FFFFFFF for indefinite, edit-live, stop-live.
+  Indefinite share requires `--confirm-indefinite`. `stop_live`
+  reads the existing message's `media.geo` and reuses last-known
+  coords (NOT (0,0), which would re-anchor to Null Island).
+
+### Added — premium capabilities
+
+- `tg-messaging react` extended with `--custom-emoji-id` and `--big`
+  flags (Telegram Premium). XOR enforced between `--emoji` and
+  `--custom-emoji-id` at both schema and skill layer (counts presence,
+  not truthiness — `--custom-emoji-id 0` is valid).
+- `tg-profile emoji-status` (Telegram Premium): set or clear emoji
+  status with optional `--until` auto-removal time (must be tz-aware
+  and in the future).
+- Daemon exception handler now also classifies exceptions from
+  `telethon.errors.*` and `telethon.tl.*` modules as upstream (502),
+  so PremiumAccountRequiredError (no RPCError suffix) maps correctly.
+
+### Added — observability
+
+- **Prometheus `/metrics` endpoint**. Counter
+  `tgmcp_rpc_requests_total` (endpoint, status), histogram
+  `tgmcp_rpc_request_seconds` (endpoint, custom buckets), gauges
+  `tgmcp_sessions_loaded` and `tgmcp_daemon_up`. Endpoint label uses
+  the FastAPI route template; unmatched paths bucket to
+  `__unmatched__` to bound cardinality. `/metrics` excluded after
+  routing so it doesn't dominate its own histogram.
+
+### Added — documentation
+
+- **`docs/architecture.md`** — 9-section architecture doc covering
+  components, read-path / write-path data flows, multi-account lazy
+  loading, singleton lifecycle, paths, observability, and a per-Skill
+  endpoint+gate matrix for all 15 skills.
+
+### Tests
+
+- 509 unit tests (up from 365 at v0.4.0). Each Codex review across
+  Phase 4 closed an issue with a regression test pinning the fix.
+
+### Acknowledgments
+
+Phase 4 ran 14 additional rounds of Codex review (gpt-5.4) on top of
+the 42 prior rounds — total 56 review iterations across the project.
+Across all four phases combined: **11 BLOCKER + 60+ MAJOR + 35+
+MINOR** issues found and fixed, every one with a pinned test.
+
+
 ## [0.4.0] - 2026-04-28
 
 Phase 3: closed the gap with chigwell/telegram-mcp by adding the
