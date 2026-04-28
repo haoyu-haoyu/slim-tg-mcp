@@ -376,6 +376,36 @@ class SearchContactsReq(BaseModel):
     limit: int = Field(20, ge=1, le=100)
 
 
+# ----- Media upload -----
+
+
+# Hard cap on uploadable file size. Telegram's per-file limit (premium
+# excluded) is 2 GB. We refuse anything larger up front to avoid
+# silently truncating, and to keep a runaway agent from filling disk
+# while reading a giant file into memory.
+MAX_UPLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+
+# Telegram caption hard limit (per the API). Reject earlier here so the
+# error surface is a clean 400 at the daemon boundary, not a late upstream
+# Telethon failure mid-upload.
+MAX_CAPTION_CHARS = 1024
+
+# Voice notes must be Opus-encoded audio. We can't sniff that without
+# decoding, but we can refuse anything whose extension isn't compatible
+# up front so callers get a clear error before we burn an upload.
+VOICE_EXTS = {".ogg", ".oga", ".opus", ".mp3", ".m4a"}
+
+
+class SendMediaReq(BaseModel):
+    chat: str | int
+    file_path: str
+    caption: str = Field("", max_length=MAX_CAPTION_CHARS)
+    reply_to: Optional[int] = None
+    as_voice: bool = False
+    force_document: bool = False
+
+
 # ---------- routes ----------
 
 
@@ -737,6 +767,253 @@ async def contacts_unblock(req: ContactUserReq) -> dict[str, Any]:
 async def contacts_search(req: SearchContactsReq) -> dict[str, Any]:
     users = await _sess().search_contacts(req.query, limit=req.limit)
     return {"users": users}
+
+
+# ---------- Media upload ----------
+
+
+def _walk_parents_for_symlink(abs_path: str) -> Optional[str]:
+    """Return the first symlink found in any parent component, or None.
+
+    `os.lstat(abs_path)` only checks the leaf. An attacker who can plant
+    a symlink in any ancestor directory (`/foo/link/secret`) would bypass
+    that check, since the leaf `secret` is a regular file. Walking the
+    chain catches the case.
+    """
+    cur = os.path.dirname(abs_path)
+    while cur and cur != os.path.dirname(cur):
+        if os.path.islink(cur):
+            return cur
+        cur = os.path.dirname(cur)
+    return None
+
+
+def _check_upload_path(path_str: str) -> tuple[str, os.stat_result]:
+    """Internal: full validation. Returns (abs_path, lstat_info).
+
+    The lstat snapshot is captured here AND used downstream by
+    `_open_validated_upload` to verify the file we open is the same
+    inode/dev as what we just validated. This is what closes the
+    "regular-file-replaced-with-different-regular-file" race that
+    O_NOFOLLOW alone cannot detect (O_NOFOLLOW only blocks symlink
+    swaps).
+    """
+    import stat as _stat
+
+    from . import paths as _paths
+
+    if not path_str:
+        raise HTTPException(400, "file_path is empty")
+
+    abs_path = os.path.abspath(path_str)
+
+    bad_parent = _walk_parents_for_symlink(abs_path)
+    if bad_parent is not None:
+        raise HTTPException(
+            400,
+            f"refusing: symlink in parent component at {bad_parent!r} could "
+            "redirect the upload — pass a path with no symlinks in it",
+        )
+
+    try:
+        info = os.lstat(abs_path)
+    except FileNotFoundError as e:
+        raise HTTPException(404, f"file not found: {abs_path}") from e
+    except OSError as e:
+        raise HTTPException(400, f"cannot stat {abs_path}: {e}") from e
+
+    if _stat.S_ISLNK(info.st_mode):
+        raise HTTPException(
+            400,
+            f"refusing to upload via symlink at {abs_path} — pass the real "
+            "path; symlinks could redirect the read to a sensitive file",
+        )
+    if not _stat.S_ISREG(info.st_mode):
+        raise HTTPException(400, f"{abs_path} is not a regular file")
+    if info.st_size > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            413,
+            f"{abs_path} is {info.st_size} bytes; max is {MAX_UPLOAD_SIZE}",
+        )
+
+    real_path = os.path.realpath(abs_path)
+    real_runtime = os.path.realpath(_paths.RUNTIME_DIR)
+    if os.path.commonpath([real_path, real_runtime]) == real_runtime:
+        raise HTTPException(
+            400,
+            f"refusing to upload from the daemon's runtime directory "
+            f"(resolves to {real_runtime})",
+        )
+
+    return abs_path, info
+
+
+def _validate_upload_path(path_str: str) -> str:
+    """Public wrapper that returns just the validated absolute path.
+
+    Internally this is a snapshot check — the actual upload pipeline
+    goes through `_open_validated_upload` which keeps the lstat metadata
+    around to detect both symlink AND regular-file replacements between
+    validate and open.
+    """
+    abs_path, _ = _check_upload_path(path_str)
+    return abs_path
+
+
+def _open_validated_upload(path_str: str) -> tuple[str, int, int]:
+    """Validate + open atomically, with full TOCTOU defense.
+
+    Threat model: between `_check_upload_path` returning and `os.open`
+    completing, an attacker with write access to the file's parent dir
+    could:
+      (a) replace the file with a symlink → blocked by O_NOFOLLOW
+      (b) replace the file with a different regular file (e.g. via
+          `mv attacker.bin victim`)  → blocked by the dev+ino check
+          below: we compare `lstat` (pre-open) and `fstat` (post-open)
+          and refuse if they don't match.
+      (c) replace it with a fifo/device/etc → blocked by the post-open
+          S_ISREG check.
+
+    Returns (abs_path, size, fd). Caller closes the fd when done.
+    """
+    import stat as _stat
+
+    abs_path, lstat_info = _check_upload_path(path_str)
+
+    # Build open flags. We want:
+    #   O_RDONLY    — read access only
+    #   O_CLOEXEC   — don't leak the fd into child processes
+    #   O_NOFOLLOW  — late symlink swap → ELOOP, not silent follow
+    #   O_NONBLOCK  — late FIFO/device swap would otherwise BLOCK indefinitely
+    #                 inside os.open (the FIFO read-side waits for a writer);
+    #                 a remote prompt-injected agent could DoS the daemon by
+    #                 racing in a FIFO. Open non-blocking, then fstat, then
+    #                 reject non-regular fds before doing any I/O. We clear
+    #                 O_NONBLOCK with fcntl after the type check so Telethon
+    #                 sees a normal blocking read.
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        fd = os.open(abs_path, flags)
+    except OSError as e:
+        if e.errno in (40, 62):  # ELOOP varies (Linux=40, macOS=62)
+            raise HTTPException(
+                400, f"refusing: {abs_path} became a symlink after validation"
+            ) from e
+        raise HTTPException(400, f"cannot open {abs_path}: {e}") from e
+
+    try:
+        fstat_info = os.fstat(fd)
+
+        # Same file? Compare (dev, ino) — uniquely identifies the inode.
+        if (fstat_info.st_dev, fstat_info.st_ino) != (
+            lstat_info.st_dev,
+            lstat_info.st_ino,
+        ):
+            raise HTTPException(
+                400,
+                f"refusing: {abs_path} was replaced between validation and "
+                f"open (lstat ino={lstat_info.st_ino}, fstat ino={fstat_info.st_ino}). "
+                "Aborting upload.",
+            )
+
+        # Reject anything that isn't a regular file: FIFOs, character/block
+        # devices, sockets. The open succeeded only because O_NONBLOCK
+        # short-circuited the FIFO read-side wait; if we proceeded we'd
+        # either burn CPU on a slow read or block on a real char device.
+        if not _stat.S_ISREG(fstat_info.st_mode):
+            raise HTTPException(
+                400,
+                f"refusing: {abs_path} resolved to a non-regular file "
+                f"(mode={oct(fstat_info.st_mode)}); FIFOs / devices / sockets "
+                "are blocked to prevent DoS via late TOCTOU swap",
+            )
+
+        if fstat_info.st_size > MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                413,
+                f"{abs_path} is {fstat_info.st_size} bytes after fstat; max is {MAX_UPLOAD_SIZE}",
+            )
+
+        # Clear O_NONBLOCK so Telethon's read sees normal blocking I/O.
+        # We've now confirmed the fd points at our validated regular file,
+        # so blocking semantics are safe.
+        if hasattr(os, "O_NONBLOCK"):
+            import fcntl as _fcntl
+
+            current = _fcntl.fcntl(fd, _fcntl.F_GETFL)
+            _fcntl.fcntl(fd, _fcntl.F_SETFL, current & ~os.O_NONBLOCK)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+    return abs_path, fstat_info.st_size, fd
+
+
+def _audit_path_redacted(abs_path: str) -> dict[str, Any]:
+    """Return a redacted view of a path suitable for the audit log.
+
+    Logging full absolute paths would persist sensitive directory and
+    filename data into ~/.config/tgmcp/audit.log (and any backups). We
+    record:
+      - basename (so the user can identify what was sent)
+      - parent_hash (8 hex chars of sha256 of the parent dir, lets the
+        operator correlate uploads from the same source without leaking
+        the actual directory tree)
+    """
+    import hashlib
+    import os
+
+    parent_hash = hashlib.sha256(
+        os.path.dirname(abs_path).encode("utf-8")
+    ).hexdigest()[:8]
+    return {"name": os.path.basename(abs_path), "parent_hash": parent_hash}
+
+
+@app.post("/send_media")
+async def send_media(req: SendMediaReq) -> dict[str, Any]:
+    if req.as_voice:
+        ext = os.path.splitext(req.file_path)[1].lower()
+        if ext not in VOICE_EXTS:
+            raise HTTPException(
+                400,
+                f"as_voice requires audio extension {sorted(VOICE_EXTS)}; got {ext!r}",
+            )
+
+    abs_path, size, fd = _open_validated_upload(req.file_path)
+    file_obj = os.fdopen(fd, "rb")  # closing the file closes the fd
+    try:
+        msg_id = await _sess().send_media(
+            req.chat,
+            file_obj,
+            caption=req.caption,
+            reply_to=req.reply_to,
+            as_voice=req.as_voice,
+            force_document=req.force_document,
+            display_name=os.path.basename(abs_path),
+        )
+    finally:
+        try:
+            file_obj.close()
+        except Exception:
+            pass
+
+    audit.log(
+        "send_media",
+        chat=str(req.chat),
+        size=size,
+        as_voice=req.as_voice,
+        force_document=req.force_document,
+        msg_id=msg_id,
+        **_audit_path_redacted(abs_path),
+    )
+    return {"ok": True, "msg_id": msg_id}
 
 
 # ---------- entry point ----------

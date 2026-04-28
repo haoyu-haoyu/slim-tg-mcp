@@ -207,3 +207,27 @@ class DaemonClient:
 
     def contact_search(self, query: str, limit: int = 20) -> dict[str, Any]:
         return self._post("/contacts/search", {"query": query, "limit": limit})
+
+    # ----- media upload -----
+
+    def send_media(
+        self,
+        chat: str | int,
+        file_path: str,
+        *,
+        caption: str = "",
+        reply_to: int | None = None,
+        as_voice: bool = False,
+        force_document: bool = False,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/send_media",
+            {
+                "chat": chat,
+                "file_path": file_path,
+                "caption": caption,
+                "reply_to": reply_to,
+                "as_voice": as_voice,
+                "force_document": force_document,
+            },
+        )

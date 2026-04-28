@@ -689,6 +689,50 @@ class TGSession:
         await self.client(UnblockRequest(id=user_entity))
         return True
 
+    # ----- Media upload -----
+
+    async def send_media(
+        self,
+        chat: str | int,
+        file: Any,
+        *,
+        caption: str = "",
+        reply_to: Optional[int] = None,
+        as_voice: bool = False,
+        force_document: bool = False,
+        display_name: Optional[str] = None,
+    ) -> int:
+        """Upload a file and send it to `chat`.
+
+        `file` is intentionally typed broadly: the daemon passes a
+        validated, O_NOFOLLOW-opened binary file object so we never
+        re-resolve the path after the validation check. Telethon's
+        `send_file` accepts file-likes natively and uses
+        `display_name` to set the attachment filename presented to
+        recipients (we override Telethon's default — a generic blob
+        name — with the basename we already validated).
+
+        Returns the new message id.
+        """
+        from telethon.tl.types import DocumentAttributeFilename
+
+        entity = await self.client.get_entity(chat)
+        attributes = (
+            [DocumentAttributeFilename(file_name=display_name)] if display_name else None
+        )
+        m = await self.client.send_file(
+            entity,
+            file,
+            caption=caption or None,
+            reply_to=reply_to,
+            voice_note=as_voice,
+            force_document=force_document,
+            attributes=attributes,
+        )
+        if isinstance(m, list):
+            return m[0].id if m else 0
+        return m.id
+
     async def search_contacts(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
         """Search the user's saved contacts.
 
