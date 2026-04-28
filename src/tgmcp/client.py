@@ -107,9 +107,19 @@ class DaemonClient:
         chat: str | int,
         msg_id: int,
         emoji: str | None,
+        *,
+        custom_emoji_id: int | None = None,
+        big: bool = False,
     ) -> dict[str, Any]:
         return self._post(
-            "/react", {"chat": chat, "msg_id": msg_id, "emoji": emoji}
+            "/react",
+            {
+                "chat": chat,
+                "msg_id": msg_id,
+                "emoji": emoji,
+                "custom_emoji_id": custom_emoji_id,
+                "big": big,
+            },
         )
 
     def mark_read(self, chat: str | int) -> dict[str, Any]:
@@ -410,6 +420,17 @@ class DaemonClient:
 
     def profile_photo_delete(self) -> dict[str, Any]:
         return self._post("/profile/photo_delete", {})
+
+    def profile_emoji_status(
+        self,
+        document_id: int | None = None,
+        *,
+        until_iso: str | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/profile/emoji_status",
+            {"document_id": document_id, "until": until_iso},
+        )
 
     def profile_status(self, online: bool) -> dict[str, Any]:
         return self._post("/profile/status", {"online": online})

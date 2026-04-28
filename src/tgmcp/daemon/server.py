@@ -22,7 +22,7 @@ import os
 import secrets
 import sys
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import re
@@ -220,8 +220,22 @@ async def _handle_any(_req: Request, exc: Exception) -> JSONResponse:
     # Telethon RPC errors and connection errors land here. We return 502 to
     # signal "upstream Telegram problem", with the exception class name so the
     # MCP/skill layer can branch on the kind.
+    #
+    # Telethon's auto-generated error classes don't all share a common
+    # suffix: most end in "RPCError", but specific named errors like
+    # PremiumAccountRequiredError, AuthKeyError, FloodWaitError end in
+    # plain "Error". Inspect the module path as the authoritative source —
+    # any exception class that originates from `telethon.errors.*` is
+    # upstream-Telegram by construction.
     name = type(exc).__name__
-    if name.endswith("RPCError") or "Telethon" in name or "Telegram" in name:
+    module = getattr(type(exc), "__module__", "") or ""
+    if (
+        name.endswith("RPCError")
+        or "Telethon" in name
+        or "Telegram" in name
+        or module.startswith("telethon.errors")
+        or module.startswith("telethon.tl.")
+    ):
         return _err(502, name, str(exc))
     return _err(500, name, str(exc))
 
@@ -319,6 +333,34 @@ class ReactReq(BaseModel):
     chat: str | int
     msg_id: int
     emoji: Optional[str] = None  # None clears the reaction
+    custom_emoji_id: Optional[int] = None  # Premium custom-emoji document id
+    big: bool = False  # Premium "big" reaction burst
+
+    @model_validator(mode="after")
+    def _react_xor(self) -> "ReactReq":
+        if self.emoji is not None and self.custom_emoji_id is not None:
+            raise ValueError(
+                "react takes emoji OR custom_emoji_id, not both"
+            )
+        return self
+
+
+class SetEmojiStatusReq(BaseModel):
+    document_id: Optional[int] = None  # None clears the status
+    until: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def _check_until(self) -> "SetEmojiStatusReq":
+        if self.until is not None:
+            if self.document_id is None:
+                raise ValueError(
+                    "until is only meaningful with a non-null document_id"
+                )
+            if self.until.tzinfo is None:
+                raise ValueError("until must be timezone-aware")
+            if self.until <= datetime.now(timezone.utc):
+                raise ValueError("until must be in the future")
+        return self
 
 
 class MarkReadReq(BaseModel):
@@ -1094,8 +1136,23 @@ async def unpin(req: UnpinReq) -> dict[str, Any]:
 
 @app.post("/react")
 async def react(req: ReactReq) -> dict[str, Any]:
-    await _sess().react(req.chat, req.msg_id, req.emoji)
-    audit.log("react", chat=str(req.chat), msg_id=req.msg_id, emoji=req.emoji)
+    await _sess().react(
+        req.chat,
+        req.msg_id,
+        req.emoji,
+        custom_emoji_id=req.custom_emoji_id,
+        big=req.big,
+    )
+    audit.log(
+        "react",
+        chat=str(req.chat),
+        msg_id=req.msg_id,
+        kind=(
+            "custom" if req.custom_emoji_id is not None
+            else ("emoji" if req.emoji else "clear")
+        ),
+        big=req.big,
+    )
     return {"ok": True}
 
 
@@ -1827,6 +1884,24 @@ async def profile_photo_delete() -> dict[str, Any]:
 async def profile_status(req: SetStatusReq) -> dict[str, Any]:
     await _sess().set_online_status(req.online)
     audit.log("profile_status", online=req.online)
+    return {"ok": True}
+
+
+@app.post("/profile/emoji_status")
+async def profile_emoji_status(req: SetEmojiStatusReq) -> dict[str, Any]:
+    """Set or clear the user's emoji status (Premium-only).
+
+    Returns 502 PREMIUM_REQUIRED via the generic exception handler if the
+    account doesn't hold Premium. We don't pre-check Premium here; the
+    server-side check is authoritative and a stale local cache would
+    let us mis-report.
+    """
+    await _sess().set_emoji_status(req.document_id, until=req.until)
+    audit.log(
+        "profile_emoji_status",
+        kind="clear" if req.document_id is None else "set",
+        has_until=req.until is not None,
+    )
     return {"ok": True}
 
 

@@ -58,6 +58,24 @@ def cmd_offline(args, c):
     return c.profile_status(False)
 
 
+def cmd_emoji_status(args, c):
+    """Set / clear an emoji status (Telegram Premium feature).
+
+    Pass --document-id to set; pass --clear to remove. --until expects
+    an ISO 8601 timezone-aware timestamp (e.g. 2026-12-31T23:59:00+00:00)
+    and only applies when setting.
+    """
+    if args.clear and args.document_id is not None:
+        raise SystemExit("error: --clear and --document-id are mutually exclusive")
+    if not args.clear and args.document_id is None:
+        raise SystemExit("error: pass --document-id <id> or --clear")
+    until_iso = args.until if not args.clear else None
+    return c.profile_emoji_status(
+        document_id=None if args.clear else args.document_id,
+        until_iso=until_iso,
+    )
+
+
 def cmd_set_2fa(args, c):
     """Enable / change / remove cloud-password (two-factor auth).
 
@@ -126,6 +144,29 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("online")
     sub.add_parser("offline")
 
+    em = sub.add_parser(
+        "emoji-status",
+        help="Set or clear emoji status (Telegram Premium feature)",
+    )
+    g = em.add_mutually_exclusive_group()
+    g.add_argument(
+        "--document-id",
+        type=int,
+        default=None,
+        help="Custom-emoji document id from Telegram",
+    )
+    g.add_argument(
+        "--clear",
+        action="store_true",
+        help="Remove the current emoji status (no Premium needed for clear)",
+    )
+    em.add_argument(
+        "--until",
+        default=None,
+        help="ISO 8601 timezone-aware timestamp for auto-removal "
+        "(only with --document-id)",
+    )
+
     fa = sub.add_parser("2fa")
     g = fa.add_mutually_exclusive_group()
     g.add_argument("--enable", action="store_true",
@@ -148,6 +189,7 @@ HANDLERS = {
     "online": cmd_online,
     "offline": cmd_offline,
     "2fa": cmd_set_2fa,
+    "emoji-status": cmd_emoji_status,
 }
 
 

@@ -84,12 +84,36 @@ def cmd_unpin(args: argparse.Namespace, c: DaemonClient) -> dict:
 
 
 def cmd_react(args: argparse.Namespace, c: DaemonClient) -> dict:
-    if args.clear and args.emoji:
-        raise SystemExit("error: cannot use --clear and --emoji together")
-    emoji = None if args.clear else args.emoji
-    if not args.clear and not emoji:
-        raise SystemExit("error: provide --emoji or --clear")
-    return c.react(_coerce_chat(args.chat), args.msg_id, emoji)
+    # Count *presence*, not truthiness — `--custom-emoji-id 0` is a valid
+    # int that we shouldn't silently swallow. (clear is action="store_true"
+    # so True/False is correct for that one.)
+    chosen = sum(
+        1 for x in (
+            args.clear,
+            args.emoji is not None,
+            args.custom_emoji_id is not None,
+        ) if x
+    )
+    if chosen != 1:
+        raise SystemExit(
+            "error: pass exactly one of --emoji / --custom-emoji-id / --clear"
+        )
+    if args.clear:
+        emoji = None
+        custom = None
+    elif args.custom_emoji_id is not None:
+        emoji = None
+        custom = args.custom_emoji_id
+    else:
+        emoji = args.emoji
+        custom = None
+    return c.react(
+        _coerce_chat(args.chat),
+        args.msg_id,
+        emoji,
+        custom_emoji_id=custom,
+        big=args.big,
+    )
 
 
 def cmd_read(args: argparse.Namespace, c: DaemonClient) -> dict:
@@ -140,7 +164,18 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("react")
     r.add_argument("--chat", required=True)
     r.add_argument("--msg-id", type=int, required=True)
-    r.add_argument("--emoji")
+    r.add_argument("--emoji", help="Unicode emoji (e.g. \"👍\")")
+    r.add_argument(
+        "--custom-emoji-id",
+        type=int,
+        default=None,
+        help="Premium custom-emoji document id. Mutually exclusive with --emoji.",
+    )
+    r.add_argument(
+        "--big",
+        action="store_true",
+        help="Premium-only: enlarge the burst animation",
+    )
     r.add_argument("--clear", action="store_true")
 
     rd = sub.add_parser("read")

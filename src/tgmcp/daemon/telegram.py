@@ -449,15 +449,42 @@ class TGSession:
         chat: str | int,
         msg_id: int,
         emoji: Optional[str],
+        *,
+        custom_emoji_id: Optional[int] = None,
+        big: bool = False,
     ) -> bool:
-        """Add or remove an emoji reaction. Pass emoji=None to clear."""
-        from telethon.tl.functions.messages import SendReactionRequest
-        from telethon.tl.types import ReactionEmoji
+        """Add or remove a reaction.
 
+        - `emoji` is a unicode emoji string (e.g., "👍"); pass None to clear.
+        - `custom_emoji_id` is a Telegram Premium custom-emoji document id;
+          mutually exclusive with `emoji`. Without Premium, sending a custom
+          emoji upstream-fails with PREMIUM_REQUIRED.
+        - `big` enlarges the burst animation (Premium feature for some
+          peers).
+
+        Pass `emoji=None` AND `custom_emoji_id=None` to clear.
+        """
+        from telethon.tl.functions.messages import SendReactionRequest
+        from telethon.tl.types import ReactionCustomEmoji, ReactionEmoji
+
+        if emoji is not None and custom_emoji_id is not None:
+            raise ValueError(
+                "react() takes emoji OR custom_emoji_id, not both"
+            )
         entity = await self.client.get_entity(chat)
-        reactions = [ReactionEmoji(emoticon=emoji)] if emoji else []
+        if custom_emoji_id is not None:
+            reactions = [ReactionCustomEmoji(document_id=custom_emoji_id)]
+        elif emoji is not None:
+            reactions = [ReactionEmoji(emoticon=emoji)]
+        else:
+            reactions = []
         await self.client(
-            SendReactionRequest(peer=entity, msg_id=msg_id, reaction=reactions)
+            SendReactionRequest(
+                peer=entity,
+                msg_id=msg_id,
+                big=big or None,
+                reaction=reactions,
+            )
         )
         return True
 
@@ -1474,6 +1501,34 @@ class TGSession:
             return False
         input_photo = get_input_photo(photos[0])
         await self.client(DeletePhotosRequest(id=[input_photo]))
+        return True
+
+    async def set_emoji_status(
+        self,
+        document_id: Optional[int],
+        *,
+        until: Optional[datetime] = None,
+    ) -> bool:
+        """Set or clear the user's emoji status (Premium feature).
+
+        - `document_id=None` clears the status (EmojiStatusEmpty).
+        - `document_id=<id>` sets a custom emoji status from a custom
+          emoji's document id. `until` (UTC-aware) optionally schedules
+          auto-removal.
+
+        Telegram returns PREMIUM_REQUIRED if the account doesn't hold
+        Premium. We let it propagate; the daemon's exception handler
+        maps it to a 502 with the upstream RPC error name so the
+        skill can surface a clear message.
+        """
+        from telethon.tl.functions.account import UpdateEmojiStatusRequest
+        from telethon.tl.types import EmojiStatus, EmojiStatusEmpty
+
+        if document_id is None:
+            status = EmojiStatusEmpty()
+        else:
+            status = EmojiStatus(document_id=document_id, until=until)
+        await self.client(UpdateEmojiStatusRequest(emoji_status=status))
         return True
 
     async def set_online_status(self, online: bool) -> bool:

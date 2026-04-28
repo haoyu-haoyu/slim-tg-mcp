@@ -208,7 +208,10 @@ def _load_skill():
 
 def test_skill_handlers_registered():
     mod = _load_skill()
-    expected = {"update", "username", "photo", "photo-delete", "online", "offline", "2fa"}
+    expected = {
+        "update", "username", "photo", "photo-delete",
+        "online", "offline", "2fa", "emoji-status",
+    }
     assert set(mod.HANDLERS.keys()) == expected
 
 
