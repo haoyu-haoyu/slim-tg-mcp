@@ -208,6 +208,30 @@ class DaemonClient:
     def contact_search(self, query: str, limit: int = 20) -> dict[str, Any]:
         return self._post("/contacts/search", {"query": query, "limit": limit})
 
+    # ----- export -----
+
+    def export_chat(
+        self,
+        chat: str | int,
+        out_dir: str,
+        *,
+        limit: int = 1000,
+        include_media: bool = False,
+        since_date: str | None = None,
+        until_date: str | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/export/chat",
+            {
+                "chat": chat,
+                "out_dir": out_dir,
+                "limit": limit,
+                "include_media": include_media,
+                "since_date": since_date,
+                "until_date": until_date,
+            },
+        )
+
     # ----- profile -----
 
     def profile_update(

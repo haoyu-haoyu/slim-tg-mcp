@@ -404,6 +404,33 @@ VOICE_EXTS = {".ogg", ".oga", ".opus", ".mp3", ".m4a"}
 _USERNAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{3,30}[a-zA-Z0-9]$")
 
 
+class ExportChatReq(BaseModel):
+    chat: str | int
+    out_dir: str
+    limit: int = Field(1000, ge=1, le=100000)
+    include_media: bool = False
+    since_date: Optional[datetime] = None
+    until_date: Optional[datetime] = None
+
+    @field_validator("since_date", "until_date")
+    @classmethod
+    def _normalize_to_utc(cls, v: Optional[datetime]) -> Optional[datetime]:
+        """Reject naive datetimes — comparing them to Telethon's tz-aware
+        Message.date raises TypeError, and host-tz interpretation is
+        unpredictable. Normalize to UTC so the comparison in
+        export_chat is deterministic."""
+        from datetime import timezone as _tz
+
+        if v is None:
+            return v
+        if v.tzinfo is None:
+            raise ValueError(
+                "since_date / until_date must be timezone-aware "
+                "(e.g. ...+00:00 or ...Z)"
+            )
+        return v.astimezone(_tz.utc)
+
+
 class UpdateProfileReq(BaseModel):
     first_name: Optional[str] = Field(None, min_length=1, max_length=64)
     last_name: Optional[str] = Field(None, max_length=64)
@@ -1090,6 +1117,164 @@ def _audit_path_redacted(abs_path: str) -> dict[str, Any]:
         os.path.dirname(abs_path).encode("utf-8")
     ).hexdigest()[:8]
     return {"name": os.path.basename(abs_path), "parent_hash": parent_hash}
+
+
+def _validate_export_dir(path_str: str) -> str:
+    """Validate caller-supplied EXPORT directory.
+
+    Unlike upload paths, export must accept a caller-chosen target — it's
+    the whole point of the operation. But the export will write a
+    potentially-large amount of data (messages + media) into that
+    directory, so the validator must close every redirect/clobber vector
+    we know about:
+
+      1. Symlink at leaf or in any parent → reject (could redirect
+         writes to a sensitive directory).
+      2. Path inside the daemon's RUNTIME_DIR or CONFIG_DIR → reject.
+         The runtime dir hosts the socket/lock/pid; the config dir
+         hosts encrypted sessions and the audit log. Writing the
+         export under either could clobber state.
+      3. Not a directory or doesn't exist → reject. We deliberately
+         do NOT auto-create arbitrary directories: that surface lets a
+         prompt-injected agent splash files anywhere writable.
+      4. Wrong owner → reject (squatting attempt).
+
+    Returns the validated absolute path.
+    """
+    import stat as _stat
+
+    from . import paths as _paths
+
+    if not path_str:
+        raise HTTPException(400, "out_dir is empty")
+    abs_path = os.path.abspath(path_str)
+
+    bad_parent = _walk_parents_for_symlink(abs_path)
+    if bad_parent is not None:
+        raise HTTPException(
+            400,
+            f"refusing: symlink in parent component at {bad_parent!r} could "
+            "redirect the export — pass a path with no symlinks",
+        )
+
+    try:
+        info = os.lstat(abs_path)
+    except FileNotFoundError as e:
+        raise HTTPException(
+            404,
+            f"out_dir does not exist: {abs_path}. Create it explicitly first; "
+            "the daemon will not auto-mkdir arbitrary directories.",
+        ) from e
+    except OSError as e:
+        raise HTTPException(400, f"cannot stat {abs_path}: {e}") from e
+
+    if _stat.S_ISLNK(info.st_mode):
+        raise HTTPException(400, f"out_dir {abs_path} is a symlink — refusing")
+    if not _stat.S_ISDIR(info.st_mode):
+        raise HTTPException(400, f"out_dir {abs_path} is not a directory")
+    if info.st_uid != os.getuid():
+        raise HTTPException(
+            400,
+            f"out_dir {abs_path} is owned by uid={info.st_uid}, not us — refusing",
+        )
+
+    real_target = os.path.realpath(abs_path)
+    for blocked, label in (
+        (_paths.RUNTIME_DIR, "runtime"),
+        (_paths.CONFIG_DIR, "config"),
+    ):
+        try:
+            real_blocked = os.path.realpath(blocked)
+        except OSError:
+            continue
+        if os.path.commonpath([real_target, real_blocked]) == real_blocked:
+            raise HTTPException(
+                400,
+                f"refusing: {abs_path} is inside the daemon's {label} dir "
+                f"({real_blocked}); export elsewhere",
+            )
+
+    return abs_path
+
+
+def _open_validated_export_dir(path_str: str) -> tuple[str, int]:
+    """Validate AND open as a directory fd, closing the validate→use TOCTOU.
+
+    `_validate_export_dir` snapshots the path's metadata. Without an fd
+    handoff, an attacker can swap `out_dir` to a symlink right before
+    `export_chat` does `os.mkdir(out_dir / 'chat_<id>')`. The defense:
+    open the validated path with O_DIRECTORY|O_NOFOLLOW, then have all
+    subsequent writes use `dir_fd=fd` syscalls so they're bound to the
+    inode we validated, not the name.
+
+    Returns (abs_path, dir_fd). Caller closes the fd when done.
+    """
+    import stat as _stat
+
+    abs_path = _validate_export_dir(path_str)
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(abs_path, flags)
+    except OSError as e:
+        if e.errno in (40, 62):  # ELOOP
+            raise HTTPException(
+                400, f"refusing: {abs_path} became a symlink after validation"
+            ) from e
+        raise HTTPException(400, f"cannot open {abs_path}: {e}") from e
+
+    try:
+        info = os.fstat(fd)
+        if not _stat.S_ISDIR(info.st_mode):
+            raise HTTPException(400, f"{abs_path} is no longer a directory after open")
+        if info.st_uid != os.getuid():
+            raise HTTPException(
+                400,
+                f"{abs_path} owner changed between validate and open — "
+                "refusing the export",
+            )
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+    return abs_path, fd
+
+
+@app.post("/export/chat")
+async def export_chat(req: ExportChatReq) -> dict[str, Any]:
+    abs_dir, dir_fd = _open_validated_export_dir(req.out_dir)
+    try:
+        res = await _sess().export_chat(
+            req.chat,
+            abs_dir,
+            dir_fd,
+            limit=req.limit,
+            include_media=req.include_media,
+            since_date=req.since_date,
+            until_date=req.until_date,
+        )
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+    audit.log(
+        "export_chat",
+        chat=str(req.chat),
+        # Audit logs the export TARGET (operator visibility) but NOT the
+        # message content. The export file itself contains the bodies; the
+        # audit just records that an export happened.
+        out_dir=abs_dir,
+        message_count=res.get("message_count"),
+        media_count=res.get("media_count"),
+        include_media=req.include_media,
+    )
+    return res
 
 
 @app.post("/profile/update")

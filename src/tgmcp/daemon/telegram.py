@@ -689,6 +689,205 @@ class TGSession:
         await self.client(UnblockRequest(id=user_entity))
         return True
 
+    # ----- Chat export -----
+
+    async def export_chat(
+        self,
+        chat: str | int,
+        out_dir: str,
+        out_dir_fd: int,
+        *,
+        limit: int = 1000,
+        include_media: bool = False,
+        since_date: Optional[datetime] = None,
+        until_date: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        """Export `chat`'s history to `<out_dir>/chat_<peer_id>/`.
+
+        TOCTOU note: every filesystem operation is performed RELATIVE TO
+        an fd (`dir_fd=` kwargs and openat-style flags). The caller has
+        already validated `out_dir` and opened it as `out_dir_fd`; we
+        never re-resolve `out_dir` by path here. `chat_<id>` and
+        `media/` are mkdir'd via dir_fd so a symlink swap of the parent
+        cannot redirect us. Pre-existing children must be real
+        directories owned by us — symlinked children with the same name
+        are rejected via O_NOFOLLOW open + fstat.
+
+        messages.json is written through a dir_fd-relative O_CREAT|
+        O_EXCL|O_NOFOLLOW open. Each media download streams into a file
+        opened the same way and passed to Telethon as a file object,
+        so download_media never reopens by path either.
+        """
+        import json
+        import os
+        import secrets
+        import stat as _stat
+
+        def _open_subdir(name: str, *, parent_fd: int) -> int:
+            """Create or open a child directory safely under parent_fd.
+
+            We don't trust O_NOFOLLOW alone for the "pre-existing
+            symlink" detection because errno varies by OS (ELOOP on
+            Linux, ENOTDIR on macOS for symlink→dir under O_NOFOLLOW).
+            Instead, fstatat the name first via `os.stat(..., dir_fd=,
+            follow_symlinks=False)`:
+              - If absent: mkdir atomically.
+              - If present as symlink/non-dir/foreign-owned: refuse.
+              - If present as our real dir: continue.
+            Then open the now-known-good name with O_NOFOLLOW for fd
+            ownership.
+            """
+            try:
+                pre = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pre = None
+            except OSError as e:
+                raise RuntimeError(f"stat {name!r} failed: {e}") from e
+
+            if pre is None:
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+                except OSError as e:
+                    raise RuntimeError(f"mkdir {name!r} failed: {e}") from e
+            else:
+                if _stat.S_ISLNK(pre.st_mode):
+                    raise RuntimeError(
+                        f"refusing: {name!r} is a symlink under the export root"
+                    )
+                if not _stat.S_ISDIR(pre.st_mode):
+                    raise RuntimeError(
+                        f"refusing: {name!r} exists and is not a directory"
+                    )
+                if pre.st_uid != os.getuid():
+                    raise RuntimeError(
+                        f"refusing: {name!r} is not owned by us"
+                    )
+
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(name, flags, dir_fd=parent_fd)
+            info = os.fstat(fd)
+            if not _stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                os.close(fd)
+                raise RuntimeError(
+                    f"refusing: {name!r} is not a real directory owned by us"
+                )
+            return fd
+
+        entity = await self.client.get_entity(chat)
+        chat_id = await self.client.get_peer_id(entity)
+        chat_subname = f"chat_{chat_id}"
+
+        chat_dir_fd = _open_subdir(chat_subname, parent_fd=out_dir_fd)
+        media_dir_fd: Optional[int] = None
+        try:
+            if include_media:
+                media_dir_fd = _open_subdir("media", parent_fd=chat_dir_fd)
+
+            messages: list[dict[str, Any]] = []
+            media_count = 0
+            async for m in self.client.iter_messages(
+                entity, limit=limit, offset_date=until_date
+            ):
+                if since_date and m.date and m.date < since_date:
+                    break
+                text = m.message or ""
+                rec: dict[str, Any] = {
+                    "id": m.id,
+                    "date": m.date.astimezone(timezone.utc).isoformat()
+                    if m.date
+                    else None,
+                    "sender_id": m.sender_id,
+                    "text": text,
+                    "reply_to_msg_id": m.reply_to_msg_id,
+                    "has_media": m.media is not None,
+                }
+                if include_media and m.media and media_dir_fd is not None:
+                    ext = ""
+                    fmeta = getattr(m, "file", None)
+                    if fmeta is not None:
+                        raw = getattr(fmeta, "ext", "") or ""
+                        if raw and "/" not in raw and "\\" not in raw and len(raw) <= 16:
+                            ext = raw if raw.startswith(".") else f".{raw}"
+                    fname = f"{m.id}-{secrets.token_hex(4)}{ext}"
+                    flags = (
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+                    )
+                    if hasattr(os, "O_NOFOLLOW"):
+                        flags |= os.O_NOFOLLOW
+                    media_fd = os.open(fname, flags, 0o600, dir_fd=media_dir_fd)
+                    media_file_obj = os.fdopen(media_fd, "wb")
+                    try:
+                        downloaded = await self.client.download_media(
+                            m, file=media_file_obj
+                        )
+                    finally:
+                        try:
+                            media_file_obj.close()
+                        except Exception:
+                            pass
+                    if downloaded:
+                        rec["media_file"] = f"media/{fname}"
+                        media_count += 1
+                messages.append(rec)
+
+            chat_meta = {
+                "id": chat_id,
+                "kind": _entity_kind(entity),
+                "title": getattr(entity, "title", None)
+                or getattr(entity, "first_name", None)
+                or "",
+                "username": getattr(entity, "username", None),
+            }
+            payload = {
+                "chat": chat_meta,
+                "exported_at": datetime.now(timezone.utc).isoformat(),
+                "message_count": len(messages),
+                "media_count": media_count,
+                "messages": messages,
+            }
+
+            # messages.json: openat-style with O_EXCL so a pre-existing file
+            # at that name (e.g. someone planted one between our chat_<id>
+            # mkdir and now, or a prior failed export) makes the open fail
+            # outright. We never silently overwrite an export target.
+            json_flags = (
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+            )
+            if hasattr(os, "O_NOFOLLOW"):
+                json_flags |= os.O_NOFOLLOW
+            try:
+                json_fd = os.open(
+                    "messages.json", json_flags, 0o600, dir_fd=chat_dir_fd
+                )
+            except FileExistsError as e:
+                raise RuntimeError(
+                    "refusing: chat_<id>/messages.json already exists. "
+                    "Move the previous export aside before re-running."
+                ) from e
+            with os.fdopen(json_fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        finally:
+            if media_dir_fd is not None:
+                try:
+                    os.close(media_dir_fd)
+                except OSError:
+                    pass
+            try:
+                os.close(chat_dir_fd)
+            except OSError:
+                pass
+
+        # The returned paths are informational; we don't re-use them for I/O.
+        chat_dir_path = os.path.join(out_dir, chat_subname)
+        return {
+            "out_dir": chat_dir_path,
+            "json_file": os.path.join(chat_dir_path, "messages.json"),
+            "message_count": len(messages),
+            "media_count": media_count,
+        }
+
     # ----- Profile -----
 
     async def update_profile(
