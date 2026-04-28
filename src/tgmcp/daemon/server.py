@@ -33,7 +33,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from . import audit, auth
+from . import audit, auth, metrics
 from .telegram import TGConfig, TGSession
 
 # Pid-keyed instance-id store. We can't just use a module-level constant:
@@ -166,9 +166,12 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     sess = await _open_session(label, passphrase)
     state.sessions[label] = sess
     state.active_label = label
+    metrics.set_daemon_up(True)
+    metrics.set_sessions_loaded(len(state.sessions))
     try:
         yield
     finally:
+        metrics.set_daemon_up(False)
         # Stop every session we ever loaded, not just the active one.
         for s in list(state.sessions.values()):
             try:
@@ -177,9 +180,46 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
                 pass
         state.sessions.clear()
         state.active_label = None
+        metrics.set_sessions_loaded(0)
 
 
 app = FastAPI(title="slim-tg-mcp daemon", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
+    """Record Prometheus counters/latency for every request.
+
+    Cardinality safety:
+    - Endpoint label is the matched FastAPI route template (drops path
+      params), so e.g. /search/global stays one series even with many
+      callers.
+    - For UNMATCHED paths (random 404s from probing tools) we bucket
+      them under a single sentinel `__unmatched__` rather than the raw
+      url.path; otherwise a noisy caller could explode the series count.
+    - Status label is the HTTP integer as string — naturally bounded.
+
+    Self-scrape exclusion:
+    - Done after call_next so we use the matched route template, not the
+      raw path. Robust to the app being mounted under a prefix
+      (everything under .../metrics still excludes correctly because the
+      template is "/metrics" regardless of mount).
+    """
+    import time as _time
+
+    started = _time.monotonic()
+    status = 500  # default if call_next raises before producing a response
+    response = None
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        template = getattr(route, "path", None)
+        endpoint = template if template else "__unmatched__"
+        if endpoint != "/metrics":
+            metrics.observe_request(endpoint, status, started)
 
 
 def _err(status: int, kind: str, detail: str) -> JSONResponse:
@@ -892,6 +932,20 @@ class SendMediaReq(BaseModel):
 # ---------- routes ----------
 
 
+@app.get("/metrics")
+async def metrics_endpoint() -> Any:
+    """Prometheus scrape endpoint. Returns plain text in the
+    OpenMetrics/Prometheus exposition format.
+
+    The route is intentionally excluded from the metrics middleware (it
+    would otherwise count itself on every scrape).
+    """
+    from fastapi.responses import Response
+
+    body, content_type = metrics.render_latest()
+    return Response(content=body, media_type=content_type)
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     label = state.active_label
@@ -971,6 +1025,7 @@ async def switch_account(req: SwitchAccountReq) -> dict[str, Any]:
                     req.passphrase = None
                     raise
                 state.sessions[req.label] = sess
+                metrics.set_sessions_loaded(len(state.sessions))
         # Don't keep the request body around — pydantic holds the passphrase
         # as a model field which would otherwise outlive the call.
         req.passphrase = None

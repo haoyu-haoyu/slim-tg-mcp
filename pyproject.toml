@@ -29,6 +29,7 @@ dependencies = [
     "cryptography>=42.0",
     "pydantic>=2.6",
     "rich>=13.7",
+    "prometheus_client>=0.14",
 ]
 
 [project.optional-dependencies]
