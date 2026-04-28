@@ -397,6 +397,46 @@ MAX_CAPTION_CHARS = 1024
 VOICE_EXTS = {".ogg", ".oga", ".opus", ".mp3", ".m4a"}
 
 
+# Telegram rejects usernames that end in `_` even though intermediate
+# underscores are fine. Anchor the last char to alphanumeric only:
+#   1 letter prefix + 3..30 mid chars (alnum or `_`) + 1 alnum suffix
+# = 5..32 chars total.
+_USERNAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{3,30}[a-zA-Z0-9]$")
+
+
+class UpdateProfileReq(BaseModel):
+    first_name: Optional[str] = Field(None, min_length=1, max_length=64)
+    last_name: Optional[str] = Field(None, max_length=64)
+    # Telegram caps: 70 chars (premium goes to 140 but we conservatively
+    # bound to 70 so non-premium users can't trigger a late upstream error).
+    about: Optional[str] = Field(None, max_length=140)
+
+
+class UpdateUsernameReq(BaseModel):
+    """Empty string clears the public username."""
+    username: str = Field(..., max_length=32)
+
+    @field_validator("username")
+    @classmethod
+    def _validate(cls, v: str) -> str:
+        if v == "":
+            return v  # clear-username request
+        if not _USERNAME_RE.fullmatch(v):
+            raise ValueError(
+                "username must be 5–32 chars, start with a letter, and "
+                "contain only [a-zA-Z0-9_]"
+            )
+        return v
+
+
+class SetPhotoReq(BaseModel):
+    file_path: str
+
+
+class SetStatusReq(BaseModel):
+    online: bool
+
+
 class SendScheduledReq(BaseModel):
     chat: str | int
     text: str = Field(..., min_length=1, max_length=4096)
@@ -1050,6 +1090,68 @@ def _audit_path_redacted(abs_path: str) -> dict[str, Any]:
         os.path.dirname(abs_path).encode("utf-8")
     ).hexdigest()[:8]
     return {"name": os.path.basename(abs_path), "parent_hash": parent_hash}
+
+
+@app.post("/profile/update")
+async def profile_update(req: UpdateProfileReq) -> dict[str, Any]:
+    info = await _sess().update_profile(
+        first_name=req.first_name, last_name=req.last_name, about=req.about
+    )
+    audit.log(
+        "profile_update",
+        # Record what FIELDS were touched and their lengths, never the values.
+        # Display names + bio can be very personal (real names, contact info).
+        # `is not None` (vs truthiness) so that an explicit clear with `""`
+        # is recorded as length 0 — distinguishable from "field not supplied".
+        first_name_len=len(req.first_name) if req.first_name is not None else None,
+        last_name_len=len(req.last_name) if req.last_name is not None else None,
+        about_len=len(req.about) if req.about is not None else None,
+    )
+    return info
+
+
+@app.post("/profile/username")
+async def profile_username(req: UpdateUsernameReq) -> dict[str, Any]:
+    info = await _sess().update_username(req.username)
+    # The username is public, so logging it is fine — and useful, since
+    # username changes affect how others reach the user.
+    audit.log("profile_username", new_username=req.username or "(cleared)")
+    return info
+
+
+@app.post("/profile/photo")
+async def profile_photo(req: SetPhotoReq) -> dict[str, Any]:
+    """Reuse the same TOCTOU-hardened pipeline media uploads use."""
+    abs_path, size, fd = _open_validated_upload(req.file_path)
+    file_obj = os.fdopen(fd, "rb")
+    try:
+        info = await _sess().set_profile_photo(file_obj)
+    finally:
+        try:
+            file_obj.close()
+        except Exception:
+            pass
+    audit.log(
+        "profile_photo_set",
+        size=size,
+        photo_id=info.get("photo_id"),
+        **_audit_path_redacted(abs_path),
+    )
+    return info
+
+
+@app.post("/profile/photo_delete")
+async def profile_photo_delete() -> dict[str, Any]:
+    deleted = await _sess().delete_current_profile_photo()
+    audit.log("profile_photo_delete", deleted=deleted)
+    return {"ok": True, "deleted": deleted}
+
+
+@app.post("/profile/status")
+async def profile_status(req: SetStatusReq) -> dict[str, Any]:
+    await _sess().set_online_status(req.online)
+    audit.log("profile_status", online=req.online)
+    return {"ok": True}
 
 
 @app.post("/scheduled/send")

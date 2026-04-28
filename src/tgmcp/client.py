@@ -208,6 +208,36 @@ class DaemonClient:
     def contact_search(self, query: str, limit: int = 20) -> dict[str, Any]:
         return self._post("/contacts/search", {"query": query, "limit": limit})
 
+    # ----- profile -----
+
+    def profile_update(
+        self,
+        *,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        about: str | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/profile/update",
+            {
+                "first_name": first_name,
+                "last_name": last_name,
+                "about": about,
+            },
+        )
+
+    def profile_username(self, username: str) -> dict[str, Any]:
+        return self._post("/profile/username", {"username": username})
+
+    def profile_photo(self, file_path: str) -> dict[str, Any]:
+        return self._post("/profile/photo", {"file_path": file_path})
+
+    def profile_photo_delete(self) -> dict[str, Any]:
+        return self._post("/profile/photo_delete", {})
+
+    def profile_status(self, online: bool) -> dict[str, Any]:
+        return self._post("/profile/status", {"online": online})
+
     # ----- scheduling + drafts -----
 
     def scheduled_send(

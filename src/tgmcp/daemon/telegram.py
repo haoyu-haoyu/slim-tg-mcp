@@ -689,6 +689,90 @@ class TGSession:
         await self.client(UnblockRequest(id=user_entity))
         return True
 
+    # ----- Profile -----
+
+    async def update_profile(
+        self,
+        *,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+        about: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Update display name and/or bio. Pass None to leave a field unchanged.
+
+        Bio (`about`) is only present on UserFull, not the bare User
+        Telethon's `get_me()` returns, so we issue a follow-up
+        GetFullUserRequest to read back the canonical post-update value.
+        """
+        from telethon.tl.functions.account import UpdateProfileRequest
+        from telethon.tl.functions.users import GetFullUserRequest
+
+        await self.client(
+            UpdateProfileRequest(
+                first_name=first_name, last_name=last_name, about=about
+            )
+        )
+        me = await self.client.get_me()
+        new_about: Optional[str] = None
+        try:
+            full = await self.client(GetFullUserRequest(me))
+            # Telethon ≥1.30 returns UserFull with .full_user.about
+            new_about = getattr(getattr(full, "full_user", full), "about", None)
+        except Exception:
+            new_about = None
+        return {
+            "id": me.id,
+            "first_name": me.first_name,
+            "last_name": me.last_name,
+            "about": new_about,
+        }
+
+    async def update_username(self, username: str) -> dict[str, Any]:
+        """Set or clear the public @username. Pass empty string to clear."""
+        from telethon.tl.functions.account import UpdateUsernameRequest
+
+        await self.client(UpdateUsernameRequest(username=username))
+        me = await self.client.get_me()
+        return {"id": me.id, "username": me.username}
+
+    async def set_profile_photo(self, file: Any) -> dict[str, Any]:
+        """Upload a new profile photo. `file` is a file-like object opened
+        through _open_validated_upload (same TOCTOU defenses as media)."""
+        from telethon.tl.functions.photos import UploadProfilePhotoRequest
+
+        # Telethon's upload_file handles the multi-part upload chunking.
+        uploaded = await self.client.upload_file(file)
+        result = await self.client(UploadProfilePhotoRequest(file=uploaded))
+        # The new photo id is in result.photo.id (Telethon Photo).
+        return {"photo_id": getattr(result.photo, "id", None)}
+
+    async def delete_current_profile_photo(self) -> bool:
+        """Remove the active (most recent) profile photo.
+
+        Telethon doesn't expose a `get_full_user` shortcut on the client,
+        and DeletePhotosRequest requires InputPhoto, not the bare Photo
+        object. We fetch the most-recent profile photo via the public
+        helper and convert it via telethon.utils.get_input_photo, which
+        is the documented bridge between read-side Photo and write-side
+        InputPhoto.
+        """
+        from telethon.tl.functions.photos import DeletePhotosRequest
+        from telethon.utils import get_input_photo
+
+        photos = await self.client.get_profile_photos("me", limit=1)
+        if not photos:
+            return False
+        input_photo = get_input_photo(photos[0])
+        await self.client(DeletePhotosRequest(id=[input_photo]))
+        return True
+
+    async def set_online_status(self, online: bool) -> bool:
+        from telethon.tl.functions.account import UpdateStatusRequest
+
+        # Telethon's flag is `offline`, opposite of our parameter.
+        await self.client(UpdateStatusRequest(offline=not online))
+        return True
+
     # ----- Scheduled messages + Drafts -----
 
     async def send_scheduled(
