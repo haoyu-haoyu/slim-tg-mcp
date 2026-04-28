@@ -397,6 +397,33 @@ MAX_CAPTION_CHARS = 1024
 VOICE_EXTS = {".ogg", ".oga", ".opus", ".mp3", ".m4a"}
 
 
+class CreatePollReq(BaseModel):
+    chat: str | int
+    question: str = Field(..., min_length=1, max_length=300)
+    # Telegram limits: 2..10 options, each up to 100 chars.
+    options: list[str] = Field(..., min_length=2, max_length=10)
+    anonymous: bool = True
+    multiple_choice: bool = False
+    quiz: bool = False
+    correct_option: Optional[int] = None
+    explanation: str = Field("", max_length=200)
+
+    @field_validator("options")
+    @classmethod
+    def _validate_options(cls, v: list[str]) -> list[str]:
+        for i, opt in enumerate(v):
+            if not opt.strip():
+                raise ValueError(f"option[{i}] is empty")
+            if len(opt) > 100:
+                raise ValueError(f"option[{i}] exceeds 100 chars (got {len(opt)})")
+        return v
+
+
+class PollMsgReq(BaseModel):
+    chat: str | int
+    msg_id: int
+
+
 class SendMediaReq(BaseModel):
     chat: str | int
     file_path: str
@@ -974,6 +1001,41 @@ def _audit_path_redacted(abs_path: str) -> dict[str, Any]:
         os.path.dirname(abs_path).encode("utf-8")
     ).hexdigest()[:8]
     return {"name": os.path.basename(abs_path), "parent_hash": parent_hash}
+
+
+@app.post("/poll/create")
+async def poll_create(req: CreatePollReq) -> dict[str, Any]:
+    msg_id = await _sess().create_poll(
+        req.chat,
+        req.question,
+        req.options,
+        anonymous=req.anonymous,
+        multiple_choice=req.multiple_choice,
+        quiz=req.quiz,
+        correct_option=req.correct_option,
+        explanation=req.explanation,
+    )
+    audit.log(
+        "poll_create",
+        chat=str(req.chat),
+        msg_id=msg_id,
+        n_options=len(req.options),
+        quiz=req.quiz,
+        anonymous=req.anonymous,
+    )
+    return {"ok": True, "msg_id": msg_id}
+
+
+@app.post("/poll/close")
+async def poll_close(req: PollMsgReq) -> dict[str, Any]:
+    await _sess().close_poll(req.chat, req.msg_id)
+    audit.log("poll_close", chat=str(req.chat), msg_id=req.msg_id)
+    return {"ok": True}
+
+
+@app.post("/poll/results")
+async def poll_results(req: PollMsgReq) -> dict[str, Any]:
+    return await _sess().poll_results(req.chat, req.msg_id)
 
 
 @app.post("/send_media")

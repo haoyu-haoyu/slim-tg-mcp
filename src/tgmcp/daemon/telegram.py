@@ -689,6 +689,145 @@ class TGSession:
         await self.client(UnblockRequest(id=user_entity))
         return True
 
+    # ----- Polls -----
+
+    async def create_poll(
+        self,
+        chat: str | int,
+        question: str,
+        options: list[str],
+        *,
+        anonymous: bool = True,
+        multiple_choice: bool = False,
+        quiz: bool = False,
+        correct_option: Optional[int] = None,
+        explanation: str = "",
+    ) -> int:
+        """Send a poll to `chat`. Returns the message id of the poll.
+
+        - `anonymous=False` reveals voters' identities to the chat.
+        - `quiz=True` makes a single-correct-answer quiz; `correct_option`
+          is the 0-based index of the right answer and is required.
+          `multiple_choice` is incompatible with `quiz`.
+        - `explanation` shows after a quiz answer is selected (max 200 chars
+          per Telegram docs).
+        """
+        from telethon.tl.types import (
+            InputMediaPoll,
+            Poll,
+            PollAnswer,
+        )
+
+        if quiz:
+            if multiple_choice:
+                raise ValueError("quiz polls cannot be multiple_choice")
+            if correct_option is None:
+                raise ValueError("quiz polls require correct_option")
+            if not (0 <= correct_option < len(options)):
+                raise ValueError(
+                    f"correct_option {correct_option} out of range for {len(options)} options"
+                )
+
+        # Telethon expects answer.option to be unique short bytes used as
+        # internal identifiers. Use the index, encoded as bytes.
+        answers = [
+            PollAnswer(text=text, option=bytes([i])) for i, text in enumerate(options)
+        ]
+        poll = Poll(
+            id=0,
+            question=question,
+            answers=answers,
+            closed=False,
+            public_voters=not anonymous,
+            multiple_choice=multiple_choice,
+            quiz=quiz,
+        )
+        media = InputMediaPoll(
+            poll=poll,
+            correct_answers=[bytes([correct_option])] if quiz and correct_option is not None else None,
+            solution=explanation if quiz and explanation else None,
+            solution_entities=[] if quiz and explanation else None,
+        )
+
+        entity = await self.client.get_entity(chat)
+        m = await self.client.send_file(entity, media)
+        return m.id
+
+    async def close_poll(self, chat: str | int, msg_id: int) -> bool:
+        """Close a previously-sent poll so no further votes are accepted.
+
+        We preserve the entire original Poll object via shallow copy and
+        only flip `closed=True`. A previous version reconstructed the
+        Poll from a hand-picked subset of fields, which could silently
+        drop optional metadata (e.g. close_period / close_date for
+        timer-closed polls) on the round trip.
+        """
+        import copy as _copy
+
+        from telethon.tl.functions.messages import EditMessageRequest
+        from telethon.tl.types import InputMediaPoll
+
+        entity = await self.client.get_entity(chat)
+        existing = await self.client.get_messages(entity, ids=msg_id)
+        if not existing or not existing.poll:
+            raise ValueError(f"message {msg_id} in {chat} is not a poll")
+
+        closed_poll = _copy.copy(existing.poll.poll)
+        closed_poll.closed = True
+        await self.client(
+            EditMessageRequest(
+                peer=entity,
+                id=msg_id,
+                media=InputMediaPoll(poll=closed_poll),
+            )
+        )
+        return True
+
+    async def poll_results(self, chat: str | int, msg_id: int) -> dict[str, Any]:
+        """Read current poll standings."""
+        entity = await self.client.get_entity(chat)
+        m = await self.client.get_messages(entity, ids=msg_id)
+        if not m or not m.poll:
+            raise ValueError(f"message {msg_id} in {chat} is not a poll")
+
+        poll = m.poll.poll
+        results = m.poll.results
+
+        # Build an explicit (option_bytes -> answer_index) map from the poll
+        # itself. Don't assume option bytes are bytes([i]) — Telegram allows
+        # arbitrary opaque IDs, and a poll authored by the official client
+        # uses different bytes than ours. Looking up by exact bytes is the
+        # only correct way to align result buckets to answer indices.
+        option_to_index: dict[bytes, int] = {
+            ans.option: i for i, ans in enumerate(poll.answers)
+        }
+
+        per_option_votes: dict[int, int] = {}
+        if results and getattr(results, "results", None):
+            for r in results.results:
+                idx = option_to_index.get(r.option)
+                if idx is not None:
+                    per_option_votes[idx] = r.voters
+
+        out = {
+            "msg_id": msg_id,
+            "question": poll.question,
+            "closed": poll.closed,
+            "anonymous": not poll.public_voters,
+            "multiple_choice": poll.multiple_choice,
+            "quiz": poll.quiz,
+            "total_voters": getattr(results, "total_voters", 0) if results else 0,
+            "options": [
+                {
+                    "index": i,
+                    "text": ans.text,
+                    "votes": per_option_votes.get(i, 0),
+                }
+                for i, ans in enumerate(poll.answers)
+            ],
+        }
+        return out
+
     # ----- Media upload -----
 
     async def send_media(

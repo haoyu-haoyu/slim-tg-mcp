@@ -208,6 +208,40 @@ class DaemonClient:
     def contact_search(self, query: str, limit: int = 20) -> dict[str, Any]:
         return self._post("/contacts/search", {"query": query, "limit": limit})
 
+    # ----- polls -----
+
+    def poll_create(
+        self,
+        chat: str | int,
+        question: str,
+        options: list[str],
+        *,
+        anonymous: bool = True,
+        multiple_choice: bool = False,
+        quiz: bool = False,
+        correct_option: int | None = None,
+        explanation: str = "",
+    ) -> dict[str, Any]:
+        return self._post(
+            "/poll/create",
+            {
+                "chat": chat,
+                "question": question,
+                "options": options,
+                "anonymous": anonymous,
+                "multiple_choice": multiple_choice,
+                "quiz": quiz,
+                "correct_option": correct_option,
+                "explanation": explanation,
+            },
+        )
+
+    def poll_close(self, chat: str | int, msg_id: int) -> dict[str, Any]:
+        return self._post("/poll/close", {"chat": chat, "msg_id": msg_id})
+
+    def poll_results(self, chat: str | int, msg_id: int) -> dict[str, Any]:
+        return self._post("/poll/results", {"chat": chat, "msg_id": msg_id})
+
     # ----- media upload -----
 
     def send_media(
