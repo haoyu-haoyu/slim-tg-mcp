@@ -548,6 +548,27 @@ class DaemonClient:
             },
         )
 
+    # ----- Stories -----
+
+    def stories_active(self, peer: str | int) -> dict[str, Any]:
+        return self._post("/stories/active", {"peer": peer})
+
+    def stories_pinned(
+        self, peer: str | int, *, limit: int = 50, offset_id: int = 0
+    ) -> dict[str, Any]:
+        return self._post(
+            "/stories/pinned",
+            {"peer": peer, "limit": limit, "offset_id": offset_id},
+        )
+
+    def stories_mark_read(self, peer: str | int, max_id: int) -> dict[str, Any]:
+        return self._post(
+            "/stories/mark_read", {"peer": peer, "max_id": max_id}
+        )
+
+    def stories_delete(self, ids: list[int]) -> dict[str, Any]:
+        return self._post("/stories/delete", {"ids": ids})
+
     # ----- Forum topics -----
 
     def topics_list(

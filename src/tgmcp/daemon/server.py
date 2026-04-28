@@ -2025,6 +2025,64 @@ async def send_media(req: SendMediaReq) -> dict[str, Any]:
     return {"ok": True, "msg_id": msg_id}
 
 
+# ---------- stories ----------
+
+
+class StoriesPeerReq(BaseModel):
+    peer: str | int
+
+
+class StoriesPinnedReq(BaseModel):
+    peer: str | int
+    limit: int = Field(50, ge=1, le=100)
+    offset_id: int = Field(0, ge=0)
+
+
+class StoriesReadReq(BaseModel):
+    peer: str | int
+    max_id: int = Field(ge=1)
+
+
+class StoriesDeleteReq(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=100)
+
+    @field_validator("ids")
+    @classmethod
+    def _ids_positive(cls, v: list[int]) -> list[int]:
+        for x in v:
+            if x < 1:
+                raise ValueError(f"story id must be ≥1, got {x}")
+        return v
+
+
+@app.post("/stories/active")
+async def stories_active(req: StoriesPeerReq) -> dict[str, Any]:
+    items = await _sess().list_active_stories(req.peer)
+    return {"stories": items, "count": len(items)}
+
+
+@app.post("/stories/pinned")
+async def stories_pinned(req: StoriesPinnedReq) -> dict[str, Any]:
+    items = await _sess().list_pinned_stories(
+        req.peer, limit=req.limit, offset_id=req.offset_id
+    )
+    return {"stories": items, "count": len(items)}
+
+
+@app.post("/stories/mark_read")
+async def stories_mark_read(req: StoriesReadReq) -> dict[str, Any]:
+    await _sess().mark_stories_read(req.peer, req.max_id)
+    audit.log("stories_mark_read", peer=str(req.peer), max_id=req.max_id)
+    return {"ok": True}
+
+
+@app.post("/stories/delete")
+async def stories_delete(req: StoriesDeleteReq) -> dict[str, Any]:
+    count = await _sess().delete_own_stories(req.ids)
+    audit.log("stories_delete", count=count, ids=req.ids)
+    return {"ok": True, "deleted": count}
+
+
 # ---------- forum topics ----------
 
 

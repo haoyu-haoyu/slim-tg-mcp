@@ -1861,6 +1861,105 @@ class TGSession:
             return m[0].id if m else 0
         return m.id
 
+    # ----- Stories -----
+
+    @staticmethod
+    def _format_story(s: Any) -> dict[str, Any]:
+        """Best-effort conversion of a Telethon Story* item to a JSON dict.
+
+        The TL types diverge between live, deleted, and skipped story
+        variants — Telethon ships StoryItem / StoryItemDeleted /
+        StoryItemSkipped. We surface a uniform dict with the live fields
+        present where they exist; deleted/skipped just carry their kind
+        and id so callers can reason about gaps.
+        """
+        kind = s.__class__.__name__
+        out: dict[str, Any] = {"kind": kind, "id": getattr(s, "id", None)}
+        if kind == "StoryItem":
+            out.update(
+                {
+                    "date": s.date.astimezone(timezone.utc).isoformat() if getattr(s, "date", None) else None,
+                    "expire_date": s.expire_date.astimezone(timezone.utc).isoformat() if getattr(s, "expire_date", None) else None,
+                    "caption": getattr(s, "caption", "") or "",
+                    "pinned": bool(getattr(s, "pinned", False)),
+                    "public": bool(getattr(s, "public", False)),
+                    "close_friends": bool(getattr(s, "close_friends", False)),
+                    "contacts": bool(getattr(s, "contacts", False)),
+                    "selected_contacts": bool(getattr(s, "selected_contacts", False)),
+                    "noforwards": bool(getattr(s, "noforwards", False)),
+                    "edited": bool(getattr(s, "edited", False)),
+                    "has_media": getattr(s, "media", None) is not None,
+                }
+            )
+        elif kind == "StoryItemSkipped":
+            out["close_friends"] = bool(getattr(s, "close_friends", False))
+        return out
+
+    async def list_active_stories(self, peer: str | int) -> list[dict[str, Any]]:
+        """Return the peer's currently-visible stories (those that haven't
+        expired yet). For your own account pass 'me'.
+        """
+        from telethon.tl.functions.stories import GetPeerStoriesRequest
+
+        entity = await self.client.get_input_entity(peer)
+        result = await self.client(GetPeerStoriesRequest(peer=entity))
+        # result.stories is PeerStories; .stories is a list of StoryItem*
+        peer_stories = getattr(result, "stories", None)
+        items = []
+        if peer_stories is not None:
+            for s in getattr(peer_stories, "stories", []):
+                items.append(self._format_story(s))
+        return items
+
+    async def list_pinned_stories(
+        self, peer: str | int, *, limit: int = 50, offset_id: int = 0
+    ) -> list[dict[str, Any]]:
+        """Return the peer's pinned (profile-permanent) stories.
+
+        Pinned stories are the ones a user/channel chose to keep visible
+        past their 24h expiry. `offset_id` is for pagination — pass the
+        last item's id from the previous call to continue.
+        """
+        from telethon.tl.functions.stories import GetPinnedStoriesRequest
+
+        entity = await self.client.get_input_entity(peer)
+        result = await self.client(
+            GetPinnedStoriesRequest(
+                peer=entity, offset_id=offset_id, limit=max(1, min(limit, 100))
+            )
+        )
+        items = []
+        for s in getattr(result, "stories", []):
+            items.append(self._format_story(s))
+        return items
+
+    async def mark_stories_read(self, peer: str | int, max_id: int) -> bool:
+        """Mark all of `peer`'s stories with id ≤ `max_id` as viewed.
+
+        Telegram tracks per-peer max read id; passing the highest id
+        you've seen is enough to ack the whole batch.
+        """
+        from telethon.tl.functions.stories import ReadStoriesRequest
+
+        entity = await self.client.get_input_entity(peer)
+        await self.client(ReadStoriesRequest(peer=entity, max_id=max_id))
+        return True
+
+    async def delete_own_stories(self, story_ids: list[int]) -> int:
+        """Delete one or more of your own stories.
+
+        The peer is hardcoded to "me" — we never delete on behalf of
+        another peer (Telegram would refuse anyway, but enforcing it
+        client-side avoids confusing errors and a misuse path).
+        """
+        from telethon.tl.functions.stories import DeleteStoriesRequest
+
+        if not story_ids:
+            raise ValueError("delete_own_stories needs at least one id")
+        entity = await self.client.get_input_entity("me")
+        await self.client(DeleteStoriesRequest(peer=entity, id=story_ids))
+        return len(story_ids)
+
     # ----- Forum topics -----
 
     async def list_topics(
