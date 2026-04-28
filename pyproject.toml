@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "slim-tg-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Slim Telegram MCP server with skill-based lazy loading, encrypted sessions, and prompt-injection defense"
 readme = "README.md"
 requires-python = ">=3.10"
