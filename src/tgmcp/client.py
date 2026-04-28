@@ -39,6 +39,16 @@ class DaemonClient:
         return r.json()
 
     # Convenience wrappers
+    def get_metrics_text(self) -> str:
+        """Fetch the /metrics endpoint as raw Prometheus exposition text.
+
+        Public alternative to reaching into self._client. Returns the
+        text body unchanged.
+        """
+        r = self._client.get("/metrics")
+        r.raise_for_status()
+        return r.text
+
     def health(self) -> dict[str, Any]:
         return self._get("/health")
 
